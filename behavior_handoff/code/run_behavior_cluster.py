@@ -43,9 +43,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from box_extract_cluster import (  # noqa: E402
-    BATCH_MB, CANONICAL_BOXES, CLUSTER_ONLY_MSG, BoxGUI, boxes_path, extract_run,
-    find_runs, natural_key, proc_dir, read_first_frame, run_tifs, save_boxes,
-    trace_writes_allowed, validate_boxes)
+    BATCH_MB, CANONICAL_BOXES, CLUSTER_ONLY_MSG, TRIM_TAIL_FRAMES, BoxGUI,
+    boxes_path, extract_run, find_runs, natural_key, proc_dir, read_first_frame,
+    run_tifs, save_boxes, trace_writes_allowed, validate_boxes)
 
 X11_HELP = """\
 To get GUIs working on the cluster:
@@ -422,6 +422,9 @@ def main():
     ap.add_argument("--strict-frames", action="store_true",
                     help="refuse runs whose movie is short instead of "
                          "salvaging the complete frames")
+    ap.add_argument("--trim-tail", type=int, default=TRIM_TAIL_FRAMES,
+                    help=f"drop the last N camera frames, written while the "
+                         f"camera is stopped (default {TRIM_TAIL_FRAMES}; 0 keeps all)")
     ap.add_argument("--allow-local", action="store_true",
                     help="override the cluster-only trace policy (synthetic tests only)")
     args = ap.parse_args()
@@ -477,7 +480,8 @@ def main():
     for run in runs:
         try:
             extract_run(run, save_mat=not args.no_mat, force=args.force,
-                        batch_mb=batch_mb, strict=args.strict_frames)
+                        batch_mb=batch_mb, strict=args.strict_frames,
+                        trim_tail=args.trim_tail)
         except Exception as e:
             print(f"[{run.name}] EXTRACT ERROR: {type(e).__name__}: {e} — "
                   f"continuing with remaining runs")

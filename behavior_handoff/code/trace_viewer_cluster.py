@@ -82,9 +82,15 @@ class Viewer:
 
         self.src = FrameSource(run_tifs(run))
         self.n = min(len(self.src), arr.shape[1])
-        if len(self.src) != arr.shape[1]:
+        gap = len(self.src) - arr.shape[1]
+        trim = int(d["trim_tail"]) if "trim_tail" in d else 0
+        if gap and gap != trim:
+            # a mismatch the tail-trim policy doesn't account for
             print(f"WARNING: movie has {len(self.src)} frames but traces have "
-                  f"{arr.shape[1]} — showing first {self.n}.")
+                  f"{arr.shape[1]} (trim_tail={trim}) — showing first {self.n}.")
+        elif trim:
+            print(f"(last {trim} frames trimmed at extraction — policy; "
+                  f"showing {self.n})")
         self.traces = arr[:, :self.n]
 
         self.k = 0

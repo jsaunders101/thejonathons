@@ -16,7 +16,11 @@ reproduce it EXACTLY (np.array_equal, no tolerance) on:
   5. trace_viewer_cluster.FrameSource on a truncated file — every frame reachable
   6. peak RSS stays bounded on a ~420 MB movie extracted with batch_mb=16
      (subprocess; catches any whole-movie materialization)
-  7. a movie cut short mid-frame (the cluster's "failed to read N bytes, got M"
+  7. the default tail-trim policy (drop the last 3 frames): kept frames are the
+     reference's leading frames unchanged, the trim is recorded in the npz, it
+     spans a file boundary correctly, it refuses to empty a too-short run, and
+     --trim-tail 0 restores whole-movie extraction
+  8. a movie cut short mid-frame (the cluster's "failed to read N bytes, got M"
      — an upload still in flight): the complete frames are salvaged and
      bit-identical to the reference, the npz is flagged `truncated`,
      --strict-frames refuses instead, and `verify` reports the short file
@@ -107,11 +111,13 @@ def load_traces(run):
     return d["traces"], d["motion_energy"]
 
 
-def check_equal(run, data, batch_mb, label):
+def check_equal(run, data, batch_mb, label, trim=0):
+    """Equivalence checks run with trim_tail=0 so they compare whole movies;
+    the trim policy itself is covered by test_trim_tail."""
     write_boxes(run)
-    extract_run(run, save_mat=False, force=True, batch_mb=batch_mb)
+    extract_run(run, save_mat=False, force=True, batch_mb=batch_mb, trim_tail=trim)
     tr, me = load_traces(run)
-    rtr, rme = reference(data, COORDS)
+    rtr, rme = reference(data[:len(data) - trim] if trim else data, COORDS)
     assert tr.shape == rtr.shape, (label, tr.shape, rtr.shape)
     assert np.array_equal(tr, rtr), f"{label}: traces differ from reference"
     assert np.array_equal(me, rme), f"{label}: motion differs from reference"
@@ -187,7 +193,7 @@ def test_aborted(work):
     fbytes = 24 * 30 * 2
     os.truncate(p, off + 32 * fbytes)          # simulate a killed recording
     write_boxes(run)
-    extract_run(run, save_mat=False, force=True, batch_mb=256)
+    extract_run(run, save_mat=False, force=True, batch_mb=256, trim_tail=0)
     tr, me = load_traces(run)
     assert tr.shape[1] == 32, f"expected clamp to 32 frames, got {tr.shape[1]}"
     rtr, rme = reference(data[:32], COORDS)
@@ -210,7 +216,8 @@ def test_rss(work):
         f"import sys; sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
         f"from pathlib import Path\n"
         f"from box_extract_cluster import extract_run\n"
-        f"extract_run(Path({str(run)!r}), save_mat=False, force=True, batch_mb=16)\n"
+        f"extract_run(Path({str(run)!r}), save_mat=False, force=True, batch_mb=16,\n"
+        f"            trim_tail=0)\n"
         f"import resource\n"
         f"r = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss\n"
         f"print('PEAK_RSS_BYTES', r if sys.platform == 'darwin' else r * 1024)\n")
@@ -232,6 +239,69 @@ def test_rss(work):
           f"peak RSS {peak_mb:.0f} MB")
 
 
+def test_trim_tail(work):
+    """Default policy: drop the last 3 frames (camera shutdown artifacts).
+
+    The kept frames must be exactly the reference's leading frames — trimming
+    from the END must not disturb any surviving frame's index or value, since
+    camera-frame indices are what the sync anchors are expressed in.
+    """
+    from box_extract_cluster import TRIM_TAIL_FRAMES, count_frames
+    assert TRIM_TAIL_FRAMES == 3, TRIM_TAIL_FRAMES
+    rng = np.random.default_rng(6)
+    run = work / "trim" / "run01"
+    run.mkdir(parents=True)
+    parts = [rng.integers(50, 60000, (n, 32, 40), dtype=np.uint16) for n in (7, 5)]
+    for k, mov in enumerate(parts):
+        tifffile.imwrite(run / f"img_{k:03d}.tif", mov, photometric="minisblack")
+    data = np.concatenate(parts)
+    assert count_frames(run_tifs(run)) == 12
+
+    write_boxes(run)
+    extract_run(run, save_mat=False, force=True)          # default trim
+    tr, me = load_traces(run)
+    assert tr.shape[1] == 9, f"expected 12-3=9 frames, got {tr.shape[1]}"
+    rtr, rme = reference(data, COORDS)
+    assert np.array_equal(tr, rtr[:, :9]), "kept frames differ from reference"
+    assert np.array_equal(me, rme[:, :9]), "kept motion differs from reference"
+    npz = sorted((run / "proc").glob("*_boxtraces.npz"))[0]
+    d = np.load(npz, allow_pickle=True)
+    assert int(d["trim_tail"]) == 3 and int(d["n_frames_source"]) == 12
+    print("PASS  trim tail: 12 -> 9 frames, kept frames bit-exact, npz records trim")
+
+    # trimming crosses a file boundary when the last part is shorter than N
+    run2 = work / "trim" / "run02"
+    run2.mkdir(parents=True)
+    parts2 = [rng.integers(50, 60000, (n, 32, 40), dtype=np.uint16) for n in (6, 2)]
+    for k, mov in enumerate(parts2):
+        tifffile.imwrite(run2 / f"img_{k:03d}.tif", mov, photometric="minisblack")
+    src2 = np.concatenate(parts2)
+    write_boxes(run2)
+    extract_run(run2, save_mat=False, force=True)
+    tr2, _ = load_traces(run2)
+    assert tr2.shape[1] == 5, f"expected 8-3=5, got {tr2.shape[1]}"
+    r2, _ = reference(src2, COORDS)
+    assert np.array_equal(tr2, r2[:, :5]), "cross-file trim altered kept frames"
+    print("PASS  trim tail spanning a file boundary (6+2 -> 5 frames)")
+
+    # a run shorter than the trim must not be wiped out
+    run3 = work / "trim" / "run03"
+    run3.mkdir(parents=True)
+    tiny = rng.integers(50, 60000, (2, 32, 40), dtype=np.uint16)
+    tifffile.imwrite(run3 / "img.tif", tiny, photometric="minisblack")
+    write_boxes(run3)
+    extract_run(run3, save_mat=False, force=True)
+    tr3, _ = load_traces(run3)
+    assert tr3.shape[1] == 2, f"tiny run should keep all 2 frames, got {tr3.shape[1]}"
+    print("PASS  trim tail refuses to empty a run shorter than the trim")
+
+    # --trim-tail 0 restores whole-movie extraction
+    extract_run(run, save_mat=False, force=True, trim_tail=0)
+    tr0, _ = load_traces(run)
+    assert tr0.shape[1] == 12 and np.array_equal(tr0, rtr)
+    print("PASS  --trim-tail 0 keeps every frame")
+
+
 def test_short_movie(work):
     """The cluster failure: a tif cut short mid-frame. Salvage + flag, not lose."""
     rng = np.random.default_rng(5)
@@ -247,7 +317,7 @@ def test_short_movie(work):
         assert len(tf.pages) == 8, "setup: IFDs should survive truncation here"
 
     write_boxes(run)
-    extract_run(run, save_mat=False, force=True, batch_mb=256)
+    extract_run(run, save_mat=False, force=True, batch_mb=256, trim_tail=0)
     tr, me = load_traces(run)
     assert tr.shape[1] == 7, f"expected 7 salvaged frames, got {tr.shape[1]}"
     rtr, rme = reference(data[:7], COORDS)
@@ -263,7 +333,8 @@ def test_short_movie(work):
     # --strict-frames refuses instead of salvaging
     for f in (run / "proc").glob("*_boxtraces.*"):
         f.unlink()
-    assert extract_run(run, save_mat=False, force=True, strict=True) is None
+    assert extract_run(run, save_mat=False, force=True, strict=True,
+                       trim_tail=0) is None
     assert not list((run / "proc").glob("*_boxtraces.npz")), \
         "--strict-frames still wrote traces"
     print("PASS  --strict-frames refuses a short movie (no traces written)")
@@ -291,6 +362,7 @@ if __name__ == "__main__":
     test_rgb(work)
     test_truncated(work)
     test_aborted(work)
+    test_trim_tail(work)
     test_short_movie(work)
     test_rss(work)
     print("\nALL TESTS PASSED")

@@ -2,7 +2,8 @@
 """Tests for run_behavior_cluster.py (headless; forces MPLBACKEND=Agg for subprocesses).
 
 1. Full headless chain on synthetic runs: --boxes-from + --no-view -> boxes written,
-   traces extracted (npz + mat, correct names/shapes), exit 0.
+   traces extracted (npz + mat, correct names/shapes), exit 0. Frame counts encode
+   the tail-trim policy (last TRIM_TAIL_FRAMES dropped); --trim-tail 0 keeps all.
 2. Idempotent rerun (skips), --force redoes.
 3. Degrade chain: no-folder + closed stdin aborts cleanly; typed path on stdin works;
    missing boxes headless refuses with guidance; empty folder refuses.
@@ -28,6 +29,7 @@ import numpy as np
 import tifffile
 
 sys.path.insert(0, str(Path(__file__).parent))
+from box_extract_cluster import TRIM_TAIL_FRAMES  # noqa: E402
 
 SCRIPT = Path(__file__).parent / "run_behavior_cluster.py"
 # M1AROUSAL_ALLOW_LOCAL: synthetic tests are the sanctioned exception to the
@@ -46,7 +48,8 @@ def make_run(folder, n_files, frames_per_file, shape=(32, 40)):
     for k in range(n_files):
         mov = rng.integers(50, 200, (frames_per_file, *shape), dtype=np.uint16)
         # minisblack forces one page per frame — without it tifffile treats a
-        # 4-frame stack as a single 4-channel page
+        # 4-frame stack as a single 4-channel page. Runs are kept comfortably
+        # longer than TRIM_TAIL_FRAMES so the tail trim never empties them.
         tifffile.imwrite(folder / f"img_{k:03d}.tif", mov,
                          photometric="minisblack")
 
@@ -64,14 +67,15 @@ def run(*a, expect=0, feed=None):
 
 def test_chain(work):
     master = work / "behavior"
-    make_run(master / "day1" / "run01", 2, 4)
-    make_run(master / "day1" / "run02", 1, 5)
+    make_run(master / "day1" / "run01", 3, 6)      # 18 frames over 3 files
+    make_run(master / "day1" / "run02", 1, 12)
 
     tmpl = work / "template_boxes.json"
     tmpl.write_text(json.dumps({"boxes": TEMPLATE_BOXES}))
 
     r = run(str(master), "--boxes-from", str(tmpl), "--no-view")
-    for name, nframes in (("run01", 8), ("run02", 5)):
+    # extraction drops the last TRIM_TAIL_FRAMES by policy (camera-shutdown frames)
+    for name, nsource in (("run01", 18), ("run02", 12)):
         proc = master / "day1" / name / "proc"
         assert (proc / "boxes.json").exists(), f"{name}: no boxes.json"
         npz = proc / f"{name}_boxtraces.npz"
@@ -79,10 +83,23 @@ def test_chain(work):
         assert npz.with_suffix(".mat").exists(), f"{name}: no mat"
         d = np.load(npz, allow_pickle=True)
         assert [str(n) for n in d["box_names"]] == ["laser_trigger", "whisker_pad"]
-        assert d["traces"].shape == (2, nframes), d["traces"].shape
-        assert d["motion_energy"].shape == (2, nframes)
+        kept = nsource - TRIM_TAIL_FRAMES
+        assert d["traces"].shape == (2, kept), d["traces"].shape
+        assert d["motion_energy"].shape == (2, kept)
+        assert int(d["trim_tail"]) == TRIM_TAIL_FRAMES
+        assert int(d["n_frames_source"]) == nsource
     assert "Done." in r.stdout
-    print("PASS  headless chain: boxes from template, both runs extracted")
+    print(f"PASS  headless chain: both runs extracted, last "
+          f"{TRIM_TAIL_FRAMES} frames trimmed by policy")
+
+    r = run(str(master), "--boxes-from", str(tmpl), "--no-view", "--force",
+            "--trim-tail", "0")
+    for name, nsource in (("run01", 18), ("run02", 12)):
+        d = np.load(master / "day1" / name / "proc" / f"{name}_boxtraces.npz",
+                    allow_pickle=True)
+        assert d["traces"].shape == (2, nsource), d["traces"].shape
+        assert int(d["trim_tail"]) == 0
+    print("PASS  --trim-tail 0 keeps every frame end-to-end")
 
     r = run(str(master), "--boxes-from", str(tmpl), "--no-view")
     assert r.stdout.count("skipping") >= 2
@@ -113,7 +130,7 @@ def test_degrade_chain(work, master, tmpl):
     print("PASS  typed path on stdin drives the full chain")
 
     master2 = work / "behavior2"
-    make_run(master2 / "run01", 1, 3)
+    make_run(master2 / "run01", 1, 9)
     r = run(str(master2), "--no-view", expect=None)
     assert r.returncode != 0
     assert "--boxes-from" in r.stdout + r.stderr, "no guidance in refusal"
@@ -128,8 +145,8 @@ def test_degrade_chain(work, master, tmpl):
 
 def test_failure_isolation(work, tmpl):
     master = work / "behavior3"
-    make_run(master / "run01", 1, 4)
-    make_run(master / "run02", 1, 4)
+    make_run(master / "run01", 1, 9)
+    make_run(master / "run02", 1, 9)
     # run03: corrupt tif, no boxes -> fails at DRAW (first-frame read), skipped
     (master / "run03").mkdir(parents=True)
     (master / "run03" / "bad.tif").write_bytes(b"this is not a tiff")

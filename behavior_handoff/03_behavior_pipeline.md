@@ -70,6 +70,11 @@ Use it to catch misplaced boxes and drift BEFORE batching a day of data.
 ## Engineering properties you inherit (keep them true)
 - Idempotent: extract skips existing outputs; `--force` to redo
 - Atomic: npz/.mat written via tmp+rename — no partial outputs ever look complete
+- Tail-trim policy: the **last 3 frames of every run are dropped** by default
+  (`--trim-tail N`, `0` keeps all). The camera is stopped by hand after the t-series
+  and its shutdown frames are unreliable. Dropped from the END only — surviving frames
+  keep their camera-frame indices, which is what the sync anchors are expressed in.
+  Never trim from the head. `trim_tail` and `n_frames_source` are recorded in the npz.
 - Short movies salvaged, never silently: a tif ending mid-frame (`failed to read N
   bytes, got M` — usually an upload still in flight) stops reading at the last complete
   frame, flags the npz (`truncated`), and makes the run exit 2. Frames are always a

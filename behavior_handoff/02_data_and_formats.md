@@ -41,6 +41,10 @@ y = row, origin top-left). One box per category — duplicates hard-error at ext
 | `box_names` | n_boxes, str | canonical category names |
 | `box_coords` | n_boxes × 4, int | x0, y0, x1, y1 |
 | `files` | list of str | source tifs, concatenation order |
+| `trim_tail` | int | camera frames dropped from the END by policy (default 3) |
+| `n_frames_source` | int | frames in the movie before trimming (−1 if not counted) |
+| `truncated` | bool | movie ended mid-frame; traces are short — see `truncated_info` |
+| `truncated_info` | str (JSON) | list of {file, at_frame, reason} for each short file |
 | `run`, `created` | str | provenance |
 
 Do not rename these keys — MATLAB analysis and the (upcoming) bundle builder consume them.

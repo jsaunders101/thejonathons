@@ -33,10 +33,12 @@ Phases:
   draw     Interactive GUI, one first-frame per run (cheap). Writes <run>/proc/boxes.json.
            'reuse previous' button copies the last run's boxes. --boxes-from applies one
            boxes.json to every run with no GUI.
-  extract  Headless, streams every frame in bounded blocks (--batch-mb, default
+  extract  Headless, streams frames in bounded blocks (--batch-mb, default
            256 MB budget) so RAM stays flat on 80+ GB movies; single-IFD
            contiguous giants (ImageJ 'truncated' >4 GB files) are read via
-           memmap. Writes <run>/proc/<run>_boxtraces.npz (+.mat).
+           memmap. The last TRIM_TAIL_FRAMES (3) frames are dropped by policy —
+           the camera writes them while being stopped — see --trim-tail.
+           Writes <run>/proc/<run>_boxtraces.npz (+.mat).
            Parallelize with --run-index in a SLURM array.
   list     Show every run and its processing status (boxes / traces / sync).
   verify   Read the first + last frame of every tif to catch files whose tail
@@ -82,6 +84,14 @@ PROC = "proc"
 DEPLOYMENT = "cluster"
 
 BATCH_MB = 256   # frame-block read budget (MB) — bounds extraction memory
+
+# Default policy (Aug 9): the camera is stopped by hand after the t-series, and
+# the last frames written during shutdown are unreliable — the final one can be
+# cut off mid-pixel-data ("failed to read N bytes, got M"). Drop the tail rather
+# than trust it. Frames are dropped from the END ONLY, so every surviving frame
+# keeps its original camera-frame index and the sync anchors stay valid.
+# Override per-invocation with --trim-tail N (0 keeps everything).
+TRIM_TAIL_FRAMES = 3
 
 CLUSTER_ONLY_MSG = (
     "Trace writing is CLUSTER-ONLY (policy Aug 9): run extraction on Elzar, where "
@@ -431,7 +441,7 @@ def cmd_draw(args):
 
 # ------------------------------------------------------------- extract phase
 
-def truncated_memmap(tf, path, report=None, at_frame=0):
+def truncated_memmap(tf, path, report=None, at_frame=0, quiet=False):
     """np.memmap over a single-IFD tif that actually holds a whole movie, or None.
 
     Writers that keep one file per movie (ImageJ convention above 4 GB, some
@@ -472,8 +482,9 @@ def truncated_memmap(tf, path, report=None, at_frame=0):
         if avail < 1:
             return None
         if avail < n:
-            note_truncation(report, path, at_frame + int(avail),
-                            ValueError(f"declares {n} frames, only {avail} present"))
+            if not quiet:
+                note_truncation(report, path, at_frame + int(avail),
+                                ValueError(f"declares {n} frames, only {avail} present"))
             n = int(avail)
         return np.memmap(path, dtype=dt, mode="r", offset=offset,
                          shape=(n,) + shape)
@@ -481,7 +492,25 @@ def truncated_memmap(tf, path, report=None, at_frame=0):
         return None
 
 
-def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None):
+def count_frames(files):
+    """Total frames in a run, from METADATA only — no pixel data is read.
+
+    Cheap enough to run before extraction, which is what lets --trim-tail stop
+    short of the unreliable tail instead of reading it and throwing it away.
+    """
+    total = 0
+    for f in files:
+        with tifffile.TiffFile(str(f)) as tf:
+            if len(tf.pages) == 1:
+                mm = truncated_memmap(tf, str(f), quiet=True)
+                total += len(mm) if mm is not None else 1
+                del mm
+            else:
+                total += len(tf.pages)
+    return total
+
+
+def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None, limit=None):
     """Yield frame blocks (n, H, W[, C]) in NATIVE dtype, each <= batch_mb MB.
 
     Bounded-memory streaming (OOM fix): extraction RAM is ~batch_mb regardless
@@ -504,17 +533,23 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None):
     """
     done = 0
     for f in files:
+        if limit is not None and done >= limit:
+            return
         with tifffile.TiffFile(str(f)) as tf:
             mm = truncated_memmap(tf, str(f), report=report, at_frame=done)
             if mm is not None:
+                take = len(mm) if limit is None else min(len(mm), limit - done)
                 step = max(1, int(batch_mb * 2**20) // max(1, mm[0].nbytes))
-                for a in range(0, len(mm), step):
+                for a in range(0, take, step):
                     yield mm[a:a + step]
-                done += len(mm)
+                done += take
                 del mm
                 continue
             block, j = None, 0
+            truncated = False
             for page in tf.pages:
+                if limit is not None and done + j >= limit:
+                    break
                 shape = tuple(page.shape)
                 if (block is None or block.shape[1:] != shape
                         or block.dtype != page.dtype):
@@ -535,10 +570,8 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None):
                         block[j] = page.asarray()
                     except Exception as e:
                         note_truncation(report, f, done + j, e)
-                        if j:
-                            yield block[:j]
-                            done += j
-                        return
+                        truncated = True
+                        break
                 j += 1
                 if j == block.shape[0]:
                     yield block
@@ -547,6 +580,8 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None):
             if block is not None and j:
                 yield block[:j]
                 done += j
+            if truncated:
+                return
 
 
 def note_truncation(report, path, frame, why):
@@ -564,7 +599,8 @@ def note_truncation(report, path, frame, why):
              "reason": f"{type(why).__name__}: {why}"})
 
 
-def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False):
+def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False,
+                trim_tail=TRIM_TAIL_FRAMES):
     files = run_tifs(run)
     bj = boxes_path(run)
     if not bj.exists():
@@ -591,11 +627,28 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False
     # reduced per frame. Reduction order matches the old per-frame loop exactly
     # (row-wise pairwise mean over the contiguous crop), so values are
     # bit-identical to the validated implementation.
+    # Tail-trim policy: stop BEFORE the unreliable shutdown frames rather than
+    # read them and discard. Counting first costs one metadata pass and means a
+    # cut-off final frame is usually never touched at all.
+    trim = max(0, int(trim_tail))
+    n_source, limit = None, None
+    if trim:
+        n_source = count_frames(files)
+        if n_source - trim < 1:
+            print(f"[{run.name}] WARNING: only {n_source} frames — NOT trimming "
+                  f"the last {trim} (nothing would be left). Extracting all.")
+            trim = 0
+        else:
+            limit = n_source - trim
+            print(f"[{run.name}] trimming last {trim} frames (policy): "
+                  f"extracting {limit} of {n_source}")
+
     tr_blocks, me_blocks = [], []
     prev = None                  # per-box float32 crop of the previous frame
     done, next_mark = 0, 2000
     report = {}
-    for block in stream_frame_blocks(files, batch_mb=batch_mb, report=report):
+    for block in stream_frame_blocks(files, batch_mb=batch_mb, report=report,
+                                     limit=limit):
         n = len(block)
         t_blk = np.empty((n_boxes, n), np.float32)
         m_blk = np.empty((n_boxes, n), np.float32)
@@ -638,7 +691,9 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False
                             files=np.array([f.name for f in files]), run=str(run),
                             created=datetime.now().isoformat(timespec="seconds"),
                             truncated=bool(trunc),
-                            truncated_info=json.dumps(trunc))
+                            truncated_info=json.dumps(trunc),
+                            trim_tail=int(trim),
+                            n_frames_source=int(n_source if n_source is not None else -1))
     os.replace(tmp, out)
     print(f"[{run.name}] wrote {out}  ({traces.shape[0]} boxes x {traces.shape[1]} frames)")
     try:
@@ -659,7 +714,10 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False
                 savemat(fh, {"traces": traces, "motion_energy": motion,
                              "box_names": names, "box_coords": coords,
                              "run": str(run), "truncated": bool(trunc),
-                             "truncated_info": json.dumps(trunc)})
+                             "truncated_info": json.dumps(trunc),
+                             "trim_tail": int(trim),
+                             "n_frames_source": int(n_source if n_source
+                                                    is not None else -1)})
             os.replace(mtmp, mat)
             print(f"[{run.name}] wrote {mat}")
         except ImportError:
@@ -691,7 +749,8 @@ def cmd_extract(args):
         runs = [runs[args.run_index]]
     for run in runs:
         extract_run(run, save_mat=not args.no_mat, force=args.force,
-                    batch_mb=args.batch_mb, strict=args.strict_frames)
+                    batch_mb=args.batch_mb, strict=args.strict_frames,
+                    trim_tail=args.trim_tail)
 
 
 # ------------------------------------------------------------ list / collect
@@ -824,6 +883,10 @@ def main():
     p.add_argument("--batch-mb", type=float, default=BATCH_MB,
                    help="frame-block read budget in MB — bounds extraction "
                         f"memory (default {BATCH_MB})")
+    p.add_argument("--trim-tail", type=int, default=TRIM_TAIL_FRAMES,
+                   help=f"drop the last N camera frames, which the camera "
+                        f"writes while being stopped (default {TRIM_TAIL_FRAMES}; "
+                        f"0 keeps every frame)")
     p.add_argument("--strict-frames", action="store_true",
                    help="refuse to write traces for a run whose movie is short "
                         "(default: salvage the complete frames and flag them)")
