@@ -15,7 +15,8 @@ always TRIES, and degrades cleanly when a window can't open:
               across runs; --boxes-from applies one boxes.json everywhere, no GUI).
               Needs a working display — refuses with X11 remediation steps otherwise.
   4. EXTRACT + REVIEW, per run: streaming trace extraction (skips already-extracted;
-              --force), then trace_viewer_cluster opens IMMEDIATELY on that run's traces —
+              --force), then trace_viewer_cluster opens IMMEDIATELY on that run's
+              MOTION ENERGY traces (--trace intensity for mean fluorescence) —
               close the window to move to the next run, q to stop opening viewers.
               If a viewer can't open (headless, dead X connection), each run gets a
               static <run>/proc/<run>_tracesqc.png instead (first frame + boxes +
@@ -365,7 +366,7 @@ def view_run(run, trace_kind, ds, stop):
     viewer.run()
 
 
-def save_trace_png(run, trace_kind="intensity", ds=2):
+def save_trace_png(run, trace_kind="motion", ds=2):
     """Static stand-in for trace_viewer_cluster: first frame + box overlays beside per-box
     traces -> <run>/proc/<stem>_tracesqc.png. Renders on an explicit Agg canvas, so
     it works with or without a display."""
@@ -389,7 +390,8 @@ def save_trace_png(run, trace_kind="intensity", ds=2):
     ax.imshow(frame, cmap="gray", vmin=vmin, vmax=vmax)
     ax.set_xticks([])
     ax.set_yticks([])
-    kind = "mean intensity" if trace_kind == "intensity" else "motion energy"
+    kind = ("mean intensity" if trace_kind == "intensity"
+            else "motion energy  mean|ΔF|")
     ax.set_title(f"{run.name} — first frame + boxes ({kind} traces)", fontsize=10)
     for name, (x0, y0, x1, y1) in zip(names, coords):
         ax.add_patch(mpatches.Rectangle(
@@ -438,8 +440,9 @@ def main():
                     help="skip review entirely (no viewer, no fallback PNGs)")
     ap.add_argument("--qc-png", action="store_true",
                     help="always write per-run *_tracesqc.png (works headless)")
-    ap.add_argument("--trace", choices=["intensity", "motion"], default="intensity",
-                    help="trace kind shown in review")
+    ap.add_argument("--trace", choices=["intensity", "motion"], default="motion",
+                    help="trace kind shown in review (default: motion energy; "
+                         "use 'intensity' for mean fluorescence)")
     ap.add_argument("--ds", type=int, default=2, help="review display downsample")
     ap.add_argument("--batch-mb", type=float, default=None,
                     help="extraction frame-block budget in MB (bounds memory; "

@@ -82,5 +82,5 @@ python box_extract_cluster.py draw    <roots> --boxes-from <run>/proc/boxes.json
 python box_extract_cluster.py extract <roots> [--force]        # stream movies → proc/*_boxtraces.npz + .mat
 python box_extract_cluster.py list    <roots> [--save runs.txt]
 python box_extract_cluster.py collect <roots> --dest <dir>     # stage proc outputs (never raw movies)
-python trace_viewer_cluster.py <run> [--trace motion] [--ds 4] # movie + traces QC playback
+python trace_viewer_cluster.py <run> [--trace intensity] [--ds 4]  # QC playback (default: motion energy)
 ```

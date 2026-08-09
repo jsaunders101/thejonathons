@@ -59,8 +59,8 @@ Freeze runs.txt at submit time — never let array tasks re-scan a tree still up
 
 ## trace_viewer_cluster.py — QC (use it, every session batch)
 ```bash
-python trace_viewer_cluster.py <run>                 # movie + per-box traces, synced cursor
-python trace_viewer_cluster.py <run> --trace motion  # motion energy instead of intensity
+python trace_viewer_cluster.py <run>                    # motion energy (DEFAULT), synced cursor
+python trace_viewer_cluster.py <run> --trace intensity  # mean fluorescence instead
 python trace_viewer_cluster.py <run> --ds 4 --fps 30 # faster display / playback
 ```
 Play/pause buttons (spacebar toggles; note plain `q` closes matplotlib windows), fps slider,

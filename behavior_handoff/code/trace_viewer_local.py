@@ -5,6 +5,12 @@ trace_viewer_local.py — play a behavior movie side-by-side with its extracted 
 Left: the movie with the box overlays drawn on it. Right: one panel per box with
 the extracted trace and a red cursor that sweeps as the movie plays.
 
+DEFAULT TRACE = MOTION ENERGY (mean |frame_t - frame_t-1| per box). That is the
+behavioural readout the analysis is built on — whisking, paw motion, grooming —
+whereas mean intensity mostly reports illumination and posture. Pass
+`--trace intensity` for the mean-fluorescence view (still the right one for
+checking the laser_trigger step or eyelid/pupil brightness).
+
 Controls: play / pause buttons (spacebar also toggles), a frame-rate slider, and
 a frame slider for scrubbing. Playback loops at the end.
 
@@ -13,9 +19,9 @@ size open instantly and RAM stays flat. Display is spatially downsampled by --ds
 (default 2) for speed; the traces are untouched.
 
 Usage:
-  python trace_viewer_local.py "/path/to/run"                 # run folder (uses proc/)
-  python trace_viewer_local.py "/path/to/run" --trace motion  # plot motion energy
-  python trace_viewer_local.py "/path/to/run" --ds 4          # faster display
+  python trace_viewer_local.py "/path/to/run"                    # motion energy
+  python trace_viewer_local.py "/path/to/run" --trace intensity  # mean fluorescence
+  python trace_viewer_local.py "/path/to/run" --ds 4             # faster display
 """
 
 import argparse
@@ -63,7 +69,7 @@ class FrameSource:
 
 
 class Viewer:
-    def __init__(self, run, trace_kind="intensity", ds=2, fps=15):
+    def __init__(self, run, trace_kind="motion", ds=2, fps=15):
         import matplotlib.pyplot as plt
         import matplotlib.patches as mpatches
         from matplotlib.widgets import Button, Slider
@@ -99,7 +105,8 @@ class Viewer:
 
         # ---- layout
         self.fig = plt.figure(figsize=(15, 8))
-        self.fig.canvas.manager.set_window_title(f"trace_viewer_local — {run.name}")
+        self.fig.canvas.manager.set_window_title(
+            f"trace_viewer_local — {run.name} [{trace_kind}]")
         self.ax_img = self.fig.add_axes([0.015, 0.16, 0.55, 0.80])
         frame = self.src.get(0)[::self.ds, ::self.ds]
         vmin, vmax = np.percentile(frame, [1, 99.5])
@@ -120,7 +127,8 @@ class Viewer:
         self.cursors = []
         top, bottom = 0.96, 0.16
         h = (top - bottom) / nb
-        kind = "mean intensity" if trace_kind == "intensity" else "motion energy"
+        kind = ("mean intensity  F  (ADU)" if trace_kind == "intensity"
+                else "motion energy  mean|ΔF|  (ADU / frame)")
         axes = []
         for i, name in enumerate(self.names):
             ax = self.fig.add_axes([0.615, top - (i + 1) * h + 0.012, 0.37, h - 0.018])
@@ -196,7 +204,8 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("run", help="run folder (with proc/ inside)")
-    ap.add_argument("--trace", choices=["intensity", "motion"], default="intensity")
+    ap.add_argument("--trace", choices=["intensity", "motion"], default="motion",
+                    help="which trace to plot (default: motion energy)")
     ap.add_argument("--ds", type=int, default=2, help="display downsample factor")
     ap.add_argument("--fps", type=int, default=15, help="initial playback rate")
     args = ap.parse_args()
