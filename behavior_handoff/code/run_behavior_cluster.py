@@ -43,9 +43,10 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from box_extract_cluster import (  # noqa: E402
-    BATCH_MB, CANONICAL_BOXES, CLUSTER_ONLY_MSG, TRIM_TAIL_FRAMES, BoxGUI,
-    boxes_path, extract_run, find_runs, natural_key, proc_dir, read_first_frame,
-    run_tifs, save_boxes, trace_writes_allowed, validate_boxes)
+    BATCH_MB, CANONICAL_BOXES, CLUSTER_ONLY_MSG, FS_HELP, TRIM_TAIL_FRAMES,
+    BoxGUI, boxes_path, check_writable, extract_run, find_runs, natural_key,
+    proc_dir, read_first_frame, rescue_boxes, run_tifs, save_boxes,
+    trace_writes_allowed, validate_boxes)
 
 X11_HELP = """\
 To get GUIs working on the cluster:
@@ -60,6 +61,21 @@ To get GUIs working on the cluster:
   - compute nodes only get a display via  srun --x11  (if the site enables it)
   - no display at all: run headless with --boxes-from <boxes.json> (draw the boxes
     in a desktop session first); review via the *_tracesqc.png files (--qc-png)."""
+
+def is_filesystem_error(e):
+    """Is this a disk/permission failure rather than a display failure?
+
+    Matters because the two need opposite remediation, and the draw phase used
+    to answer 'X11' for everything — sending a permission problem off to debug
+    X forwarding it never had.
+    """
+    if isinstance(e, (PermissionError, FileNotFoundError, IsADirectoryError,
+                      NotADirectoryError, FileExistsError)):
+        return True
+    # OSError carrying a path is a filesystem call; a dead X connection is
+    # usually RuntimeError/TclError/ImportError with no filename
+    return isinstance(e, OSError) and getattr(e, "filename", None) is not None
+
 
 _GUI = {"ok": None, "why": ""}
 
@@ -309,8 +325,12 @@ def phase_draw(runs, categories, boxes_from, redraw):
             print(f"[{run.name}] DRAW ERROR: {e} — skipping this run")
             continue
         if template is not None:
-            save_boxes(run, files, [dict(b) for b in template], frame.shape,
-                       categories)
+            try:
+                save_boxes(run, files, [dict(b) for b in template], frame.shape,
+                           categories)
+            except OSError as e:
+                print(f"[{run.name}] DRAW ERROR: cannot write boxes ({e}) — "
+                      f"skipping this run")
             continue
         gui = BoxGUI(frame, categories,
                      title=f"{run.name} — first frame ({files[0].name})",
@@ -319,7 +339,12 @@ def phase_draw(runs, categories, boxes_from, redraw):
         if not boxes:
             print(f"[{run.name}] no boxes assigned — nothing saved.")
             continue
-        save_boxes(run, files, boxes, frame.shape, categories)
+        try:
+            save_boxes(run, files, boxes, frame.shape, categories)
+        except OSError as e:
+            # hand-drawn boxes must not die with the write — dump them and
+            # keep going, so one unwritable run doesn't cost the whole session
+            rescue_boxes(run, boxes, frame.shape, categories, e)
         prev = boxes
 
 
@@ -451,6 +476,22 @@ def main():
         sys.exit(f"No runs (folders directly containing .tif files) under {folder}")
     print_status(runs, f"Master folder: {folder} — {len(runs)} runs")
 
+    # Pre-flight: outputs go to <run>/proc/, so prove that works BEFORE anyone
+    # draws a box. Catching this after a GUI session would throw away the one
+    # step in this pipeline a human can't redo cheaply.
+    blocked = [(r, why) for r, (ok, why) in
+               ((r, check_writable(r)) for r in runs) if not ok]
+    if blocked:
+        print(f"\n*** {len(blocked)} of {len(runs)} runs are NOT WRITABLE — "
+              f"skipping them ***")
+        for r, why in blocked:
+            print(f"    {r}\n        {why}")
+        print(FS_HELP)
+        runs = [r for r in runs if r not in {b[0] for b in blocked}]
+        if not runs:
+            sys.exit("\nNo writable runs left — nothing to do.")
+        print(f"\nContinuing with the {len(runs)} writable runs.")
+
     # 3. draw
     need = [r for r in runs if args.redraw or not boxes_path(r).exists()]
     if need and not args.boxes_from:
@@ -464,8 +505,11 @@ def main():
         try:
             phase_draw(runs, categories, args.boxes_from, args.redraw)
         except Exception as e:
-            # boxes.json is saved per run as we go — progress up to here persists
-            sys.exit(f"draw GUI died mid-flow ({type(e).__name__}: {e}).\n{X11_HELP}")
+            # boxes.json is saved per run as we go — progress up to here persists.
+            # Blame the right subsystem: a filesystem error is NOT an X11 problem,
+            # and printing X11 remediation for it sends people down a dead end.
+            sys.exit(f"draw phase stopped ({type(e).__name__}: {e}).\n"
+                     f"{FS_HELP if is_filesystem_error(e) else X11_HELP}")
     else:
         print("\nAll runs already have boxes.")
 
@@ -516,7 +560,10 @@ def main():
               f"    Usually an upload still in flight. Check with:\n"
               f"      python box_extract_cluster.py verify <folder>\n"
               f"    then re-extract those runs with --force once complete.")
-    if missing or truncated:
+    if blocked:
+        print(f"\n*** {len(blocked)} runs were SKIPPED as unwritable "
+              f"(see above) ***")
+    if missing or truncated or blocked:
         sys.exit(2)
     print("\nDone. Next: sync_detect_cluster.py per run (needs the t-series XML) — "
           "see ../03_synchronization.md.")

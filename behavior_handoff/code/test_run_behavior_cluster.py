@@ -13,7 +13,11 @@
 6. probe_gui reports headless under Agg.
 7. backend_is_headless truth table (REGRESSION: '"agg" in "tkagg"' substring bug
    classified working TkAgg sessions as headless).
-8. FolderPicker logic under Agg: navigate down/up, pagination, select, cancel.
+8. Read-only run folder (REGRESSION: reported as an X11 failure, aborted the flow):
+   pre-flight catches it, guidance is filesystem-not-display, writable runs still
+   process, exit 2. Plus rescue of hand-drawn boxes on save failure, and the
+   filesystem-vs-display error classifier.
+9. FolderPicker logic under Agg: navigate down/up, pagination, select, cancel.
 
 Run:  python test_run_behavior_cluster.py <workdir>
 """
@@ -169,6 +173,73 @@ def test_failure_isolation(work, tmpl):
     print("PASS  corrupt runs isolated (draw + extract), good runs still processed, exit 2")
 
 
+def test_readonly_run(work, tmpl):
+    """A run folder we cannot write to (REGRESSION: this surfaced on the cluster
+    as 'draw GUI died mid-flow (PermissionError)' followed by X11 remediation —
+    a filesystem problem misreported as a display problem, aborting every
+    remaining run).
+
+    Now: caught in pre-flight, named as a permissions issue with filesystem
+    advice, the writable runs still process, and the exit code is 2.
+    """
+    if os.geteuid() == 0:
+        print("SKIP  read-only run (running as root — chmod would not block us)")
+        return
+    master = work / "behavior_ro"
+    make_run(master / "run_ok", 1, 9)
+    make_run(master / "run_ro", 1, 9)
+    ro = master / "run_ro"
+    mode = ro.stat().st_mode
+    os.chmod(ro, 0o500)                      # r-x: listable, not writable
+    try:
+        r = run(str(master), "--boxes-from", str(tmpl), "--no-view", expect=2)
+        out = r.stdout + r.stderr
+        assert "NOT WRITABLE" in out, "unwritable run not reported in pre-flight"
+        assert "run_ro" in out
+        assert "FILESYSTEM permission problem" in out, "no filesystem guidance"
+        assert "X forwarding" not in out and "XQuartz" not in out, \
+            "X11 remediation shown for a filesystem error"
+        assert (master / "run_ok" / "proc" / "run_ok_boxtraces.npz").exists(), \
+            "writable run did not process alongside the unwritable one"
+        assert not (ro / "proc").exists(), "wrote into a read-only run"
+        print("PASS  read-only run: pre-flight catches it, filesystem (not X11) "
+              "guidance, writable run still processes, exit 2")
+    finally:
+        os.chmod(ro, mode)
+
+
+def test_rescue_boxes(work):
+    """Hand-drawn boxes must survive a failed save — they are the one step a
+    person cannot cheaply repeat."""
+    from box_extract_cluster import rescue_boxes
+    boxes = [{"name": "eye", "x0": 1, "y0": 2, "x1": 9, "y1": 8}]
+    cwd = os.getcwd()
+    os.chdir(work)
+    try:
+        out = rescue_boxes(work / "some_run", boxes, (32, 40), ["eye"],
+                           PermissionError("Permission denied"))
+        assert out is not None and out.exists(), "boxes were not rescued"
+        saved = json.loads(out.read_text())
+        assert saved["boxes"] == boxes
+        assert saved["rescued_from"].endswith("some_run")
+        print(f"PASS  rescue_boxes: drawn boxes preserved to {out.name} on save failure")
+    finally:
+        os.chdir(cwd)
+
+
+def test_error_classification():
+    """Filesystem errors must not be answered with X11 advice, and vice versa."""
+    from run_behavior_cluster import is_filesystem_error
+    fs = PermissionError(13, "Permission denied", "/data/run01/proc/boxes.json")
+    assert is_filesystem_error(fs)
+    assert is_filesystem_error(FileNotFoundError(2, "No such file", "/x"))
+    assert is_filesystem_error(OSError(28, "No space left", "/x"))
+    for gui_err in (RuntimeError("Invalid DISPLAY"), ImportError("no tkinter"),
+                    OSError("connection to X server lost")):
+        assert not is_filesystem_error(gui_err), gui_err
+    print("PASS  error classification: filesystem vs display errors separated")
+
+
 def test_cluster_guard(work, master, tmpl):
     """Off-cluster, without the override, trace writing must refuse (both entry
     points). Skipped when actually on a cluster (guard would legitimately pass)."""
@@ -275,6 +346,9 @@ if __name__ == "__main__":
     master, tmpl = test_chain(work)
     test_degrade_chain(work, master, tmpl)
     test_failure_isolation(work, tmpl)
+    test_readonly_run(work, tmpl)
+    test_rescue_boxes(work)
+    test_error_classification()
     test_cluster_guard(work, master, tmpl)
     test_probe_gui()
     test_backend_classifier()

@@ -70,6 +70,12 @@ Use it to catch misplaced boxes and drift BEFORE batching a day of data.
 ## Engineering properties you inherit (keep them true)
 - Idempotent: extract skips existing outputs; `--force` to redo
 - Atomic: npz/.mat written via tmp+rename — no partial outputs ever look complete
+- Run folders must be WRITABLE: every derived file goes to `<run>/proc/` inside the
+  run folder. run_behavior probes this before the draw phase and skips runs it cannot
+  write to (the writable ones still process, exit 2). On a read-only or
+  someone-else's tree the in-place model can't work at all — extraction writes there
+  too. If a box save fails anyway, your drawn boxes are dumped to
+  `./rescued_boxes/<run>_boxes.json`; apply them later with `--boxes-from`.
 - Tail-trim policy: the **last 3 frames of every run are dropped** by default
   (`--trim-tail N`, `0` keeps all). The camera is stopped by hand after the t-series
   and its shutdown frames are unreliable. Dropped from the END only — surviving frames

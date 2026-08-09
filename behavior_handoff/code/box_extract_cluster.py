@@ -168,8 +168,41 @@ def find_runs(roots):
     return out
 
 
+FS_HELP = """\
+This is a FILESYSTEM permission problem, not a display problem.
+Every derived file is written to <run>/proc/ inside the run folder (the
+organization contract), so the run folders must be writable by you:
+  - check who owns the tree:   ls -ld <run> <run>/proc
+  - if it belongs to a teammate, ask them for group write (chmod g+w) or copy
+    the runs somewhere you own
+  - on a course-managed / read-only share, the in-place proc/ model cannot
+    work at all — extraction writes there too, so it will fail the same way
+  - if only SOME runs are affected, the others still process; the run list
+    above says which are unwritable."""
+
+
 def proc_dir(run):
     return Path(run) / PROC
+
+
+def check_writable(run):
+    """Can we actually create <run>/proc/ and write in it? -> (ok, reason).
+
+    Probes by creating and deleting a file rather than asking os.access, which
+    lies on NFS/ACL-backed filesystems — exactly the kind the cluster uses.
+    Called BEFORE the draw phase so an unwritable tree is caught while it costs
+    nothing, instead of after someone has hand-drawn boxes for twelve runs.
+    """
+    pd = proc_dir(run)
+    try:
+        pd.mkdir(exist_ok=True)
+        probe = pd / ".write_probe"
+        probe.write_text("")
+        probe.unlink()
+        return True, ""
+    except OSError as e:
+        where = getattr(e, "filename", None) or pd
+        return False, f"{type(e).__name__}: {e.strerror or e} ({where})"
 
 
 def boxes_path(run):
@@ -384,6 +417,39 @@ class BoxGUI:
                              if c in self.assigned)]
 
 
+def rescue_boxes(run, boxes, shape, categories, why):
+    """<run>/proc/ is unwritable — dump hand-drawn boxes somewhere they survive.
+
+    Drawing boxes is the one genuinely un-repeatable step in this pipeline (a
+    person looked at a frame and placed them), so a save failure must never be
+    the end of that work. Writes to the first writable location and prints how
+    to apply the file once permissions are fixed.
+    """
+    import tempfile
+    stem = re.sub(r"\s+", "_", Path(run).name)
+    payload = json.dumps({
+        "image_shape": [int(s) for s in shape], "categories": categories,
+        "rescued_from": str(run),
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "boxes": boxes}, indent=2)
+    for base in (Path.cwd() / "rescued_boxes", Path(tempfile.gettempdir()) / "rescued_boxes"):
+        try:
+            base.mkdir(parents=True, exist_ok=True)
+            out = base / f"{stem}_boxes.json"
+            out.write_text(payload)
+            print(f"[{Path(run).name}] SAVE FAILED ({why})\n"
+                  f"    your drawn boxes were rescued to: {out}\n"
+                  f"    once the permissions are fixed, apply them with:\n"
+                  f"      --boxes-from {out}")
+            return out
+        except OSError:
+            continue
+    print(f"[{Path(run).name}] SAVE FAILED ({why}) and the boxes could not be "
+          f"rescued anywhere writable. Boxes drawn for this run are LOST.\n"
+          f"    Coordinates were: {json.dumps(boxes)}")
+    return None
+
+
 def save_boxes(run, files, boxes, shape, categories):
     validate_boxes(boxes, categories, run.name)
     pd = proc_dir(run)
@@ -426,7 +492,11 @@ def cmd_draw(args):
             prev = json.loads(bj.read_text())["boxes"]
         frame = read_first_frame(files[0])
         if args.boxes_from:
-            save_boxes(run, files, [dict(b) for b in template], frame.shape, categories)
+            try:
+                save_boxes(run, files, [dict(b) for b in template], frame.shape,
+                           categories)
+            except OSError as e:
+                print(f"[{run.name}] cannot write boxes ({e}) — skipping.\n{FS_HELP}")
             continue
         gui = BoxGUI(frame, categories,
                      title=f"{run.name} — first frame ({files[0].name})",
@@ -435,7 +505,10 @@ def cmd_draw(args):
         if not boxes:
             print(f"[{run.name}] no boxes assigned — nothing saved.")
             continue
-        save_boxes(run, files, boxes, frame.shape, categories)
+        try:
+            save_boxes(run, files, boxes, frame.shape, categories)
+        except OSError as e:
+            rescue_boxes(run, boxes, frame.shape, categories, e)
         prev = boxes
 
 
@@ -747,10 +820,25 @@ def cmd_extract(args):
         if args.run_index >= len(runs):
             sys.exit(f"--run-index {args.run_index} out of range (found {len(runs)} runs)")
         runs = [runs[args.run_index]]
+    failed = []
     for run in runs:
-        extract_run(run, save_mat=not args.no_mat, force=args.force,
-                    batch_mb=args.batch_mb, strict=args.strict_frames,
-                    trim_tail=args.trim_tail)
+        # per-run isolation: one unwritable/corrupt run must not abandon the rest
+        # of a serial batch (SLURM arrays get this for free, `extract <roots>`
+        # did not)
+        try:
+            extract_run(run, save_mat=not args.no_mat, force=args.force,
+                        batch_mb=args.batch_mb, strict=args.strict_frames,
+                        trim_tail=args.trim_tail)
+        except Exception as e:
+            print(f"[{run.name}] EXTRACT ERROR: {type(e).__name__}: {e} — "
+                  f"continuing with remaining runs")
+            failed.append(run)
+    if failed:
+        print(f"\n*** {len(failed)} runs failed: "
+              f"{', '.join(r.name for r in failed)} ***")
+        if any(not check_writable(r)[0] for r in failed):
+            print(FS_HELP)
+        sys.exit(2)
 
 
 # ------------------------------------------------------------ list / collect
