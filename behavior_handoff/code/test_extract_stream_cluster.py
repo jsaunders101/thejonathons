@@ -16,6 +16,10 @@ reproduce it EXACTLY (np.array_equal, no tolerance) on:
   5. trace_viewer_cluster.FrameSource on a truncated file — every frame reachable
   6. peak RSS stays bounded on a ~420 MB movie extracted with batch_mb=16
      (subprocess; catches any whole-movie materialization)
+  7. a movie cut short mid-frame (the cluster's "failed to read N bytes, got M"
+     — an upload still in flight): the complete frames are salvaged and
+     bit-identical to the reference, the npz is flagged `truncated`,
+     --strict-frames refuses instead, and `verify` reports the short file
 
 Run:  python test_extract_stream_cluster.py <workdir>
 """
@@ -31,7 +35,43 @@ import numpy as np
 import tifffile
 
 sys.path.insert(0, str(Path(__file__).parent))
-from box_extract_cluster import extract_run, run_tifs, to_gray, truncated_memmap  # noqa: E402
+from box_extract_cluster import (  # noqa: E402
+    cmd_verify, extract_run, run_tifs, to_gray, truncated_memmap, verify_tif)
+
+SHORT, LONG = 3, 4
+IFD_BYTES = 2 + 9 * 12 + 4
+
+
+def write_ifd_first(path, frames):
+    """Classic multi-page TIFF with each page's IFD BEFORE its pixel data.
+
+    Writers that lay files out this way (ThorCam-style) keep every IFD intact
+    when a file is cut short, so tifffile enumerates all pages and fails only
+    on the missing pixels — reproducing the cluster's
+    'ValueError: failed to read N bytes, got M'. Standard tifffile writers put
+    IFDs after data, where truncation instead collapses page enumeration, so
+    this layout has to be built by hand to test the real failure.
+    """
+    import struct
+    n, h, w = frames.shape
+    fb = h * w * frames.dtype.itemsize
+    page = IFD_BYTES + fb
+    with open(path, "wb") as f:
+        f.write(struct.pack("<2sHI", b"II", 42, 8))
+        for k in range(n):
+            ifd_off = 8 + k * page
+            data_off = ifd_off + IFD_BYTES
+            nxt = (ifd_off + page) if k < n - 1 else 0
+            entries = [(256, SHORT, 1, w), (257, SHORT, 1, h), (258, SHORT, 1, 16),
+                       (259, SHORT, 1, 1), (262, SHORT, 1, 1), (273, LONG, 1, data_off),
+                       (277, SHORT, 1, 1), (278, SHORT, 1, h), (279, LONG, 1, fb)]
+            f.write(struct.pack("<H", len(entries)))
+            for tag, typ, cnt, val in entries:
+                f.write(struct.pack("<HHIHH", tag, typ, cnt, val, 0) if typ == SHORT
+                        else struct.pack("<HHII", tag, typ, cnt, val))
+            f.write(struct.pack("<I", nxt))
+            f.write(frames[k].tobytes())
+    return path
 
 BOXES = [{"name": "laser_trigger", "x0": 1, "y0": 2, "x1": 11, "y1": 9},
          {"name": "whisker_pad", "x0": 5, "y0": 5, "x1": 30, "y1": 22}]
@@ -192,6 +232,56 @@ def test_rss(work):
           f"peak RSS {peak_mb:.0f} MB")
 
 
+def test_short_movie(work):
+    """The cluster failure: a tif cut short mid-frame. Salvage + flag, not lose."""
+    rng = np.random.default_rng(5)
+    run = work / "short" / "run01"
+    run.mkdir(parents=True)
+    data = rng.integers(50, 60000, (8, 108, 144), dtype=np.uint16)
+    p = run / "img.tif"
+    write_ifd_first(p, data)
+    with tifffile.TiffFile(str(p)) as tf:
+        assert len(tf.pages) == 8 and np.array_equal(tf.pages[7].asarray(), data[7])
+    os.truncate(p, os.path.getsize(p) - 1870)      # chop mid-final-frame
+    with tifffile.TiffFile(str(p)) as tf:
+        assert len(tf.pages) == 8, "setup: IFDs should survive truncation here"
+
+    write_boxes(run)
+    extract_run(run, save_mat=False, force=True, batch_mb=256)
+    tr, me = load_traces(run)
+    assert tr.shape[1] == 7, f"expected 7 salvaged frames, got {tr.shape[1]}"
+    rtr, rme = reference(data[:7], COORDS)
+    assert np.array_equal(tr, rtr) and np.array_equal(me, rme), \
+        "salvaged frames must match the reference exactly"
+    npz = sorted((run / "proc").glob("*_boxtraces.npz"))[0]
+    d = np.load(npz, allow_pickle=True)
+    assert bool(d["truncated"]), "npz not flagged truncated"
+    info = json.loads(str(d["truncated_info"]))
+    assert info and info[0]["at_frame"] == 7, info
+    print("PASS  short movie: 7/8 frames salvaged bit-exactly, npz flagged truncated")
+
+    # --strict-frames refuses instead of salvaging
+    for f in (run / "proc").glob("*_boxtraces.*"):
+        f.unlink()
+    assert extract_run(run, save_mat=False, force=True, strict=True) is None
+    assert not list((run / "proc").glob("*_boxtraces.npz")), \
+        "--strict-frames still wrote traces"
+    print("PASS  --strict-frames refuses a short movie (no traces written)")
+
+    ok, n, msg = verify_tif(p)
+    assert not ok and "failed to read" in msg.lower() or not ok, (ok, msg)
+    good = work / "short" / "run02"
+    good.mkdir(parents=True)
+    tifffile.imwrite(good / "img.tif", data, photometric="minisblack")
+    assert verify_tif(good / "img.tif")[0], "complete file flagged bad"
+    try:
+        cmd_verify(type("A", (), {"roots": [str(work / "short")]})())
+        raise AssertionError("verify should exit 2 when a file is short")
+    except SystemExit as e:
+        assert e.code == 2, e.code
+    print("PASS  verify: flags the short tif, passes the complete one, exits 2")
+
+
 if __name__ == "__main__":
     work = Path(sys.argv[1] if len(sys.argv) > 1 else "extract_stream_test_work")
     if work.exists():
@@ -201,5 +291,6 @@ if __name__ == "__main__":
     test_rgb(work)
     test_truncated(work)
     test_aborted(work)
+    test_short_movie(work)
     test_rss(work)
     print("\nALL TESTS PASSED")

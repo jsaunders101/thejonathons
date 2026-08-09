@@ -39,6 +39,9 @@ Phases:
            memmap. Writes <run>/proc/<run>_boxtraces.npz (+.mat).
            Parallelize with --run-index in a SLURM array.
   list     Show every run and its processing status (boxes / traces / sync).
+  verify   Read the first + last frame of every tif to catch files whose tail
+           is missing (upload still in flight, aborted recording). Run this
+           BEFORE a batch on freshly uploaded data. Exit 2 if any file is short.
   collect  Copy all proc/ outputs (NOT raw movies) into one flat folder ON THE
            CLUSTER (staging for slides/sharing — nothing leaves the cluster),
            prefixing filenames with parent folders to stay unique.
@@ -428,7 +431,7 @@ def cmd_draw(args):
 
 # ------------------------------------------------------------- extract phase
 
-def truncated_memmap(tf, path):
+def truncated_memmap(tf, path, report=None, at_frame=0):
     """np.memmap over a single-IFD tif that actually holds a whole movie, or None.
 
     Writers that keep one file per movie (ImageJ convention above 4 GB, some
@@ -469,8 +472,8 @@ def truncated_memmap(tf, path):
         if avail < 1:
             return None
         if avail < n:
-            print(f"  WARNING: {Path(path).name} declares {n} frames but only "
-                  f"{avail} are present (aborted recording?) — using {avail}")
+            note_truncation(report, path, at_frame + int(avail),
+                            ValueError(f"declares {n} frames, only {avail} present"))
             n = int(avail)
         return np.memmap(path, dtype=dt, mode="r", offset=offset,
                          shape=(n,) + shape)
@@ -478,7 +481,7 @@ def truncated_memmap(tf, path):
         return None
 
 
-def stream_frame_blocks(files, batch_mb=BATCH_MB):
+def stream_frame_blocks(files, batch_mb=BATCH_MB, report=None):
     """Yield frame blocks (n, H, W[, C]) in NATIVE dtype, each <= batch_mb MB.
 
     Bounded-memory streaming (OOM fix): extraction RAM is ~batch_mb regardless
@@ -488,16 +491,26 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB):
       - single-IFD contiguous giants (see truncated_memmap): frames sliced
         lazily off a memmap — only the bytes touched are read
 
+    Short files (interrupted upload, aborted recording) are SALVAGED, not
+    fatal: reading stops at the last complete frame and the caller is told via
+    `report`, so a whole run isn't lost to a missing final frame. Streaming
+    always stops at the first unreadable frame rather than skipping past it —
+    the surviving frames are then a CONTIGUOUS prefix, which is what the
+    camera-frame timebase and the sync anchors require. A gap would silently
+    shift every later frame's timestamp.
+
     Blocks and their views are invalidated by the next iteration — callers must
     copy anything they keep.
     """
+    done = 0
     for f in files:
         with tifffile.TiffFile(str(f)) as tf:
-            mm = truncated_memmap(tf, str(f))
+            mm = truncated_memmap(tf, str(f), report=report, at_frame=done)
             if mm is not None:
                 step = max(1, int(batch_mb * 2**20) // max(1, mm[0].nbytes))
                 for a in range(0, len(mm), step):
                     yield mm[a:a + step]
+                done += len(mm)
                 del mm
                 continue
             block, j = None, 0
@@ -507,6 +520,7 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB):
                         or block.dtype != page.dtype):
                     if block is not None and j:
                         yield block[:j]
+                        done += j
                     fbytes = (int(np.prod(shape, dtype=np.int64))
                               * np.dtype(page.dtype).itemsize)
                     n = max(1, int(batch_mb * 2**20) // max(1, fbytes))
@@ -514,16 +528,43 @@ def stream_frame_blocks(files, batch_mb=BATCH_MB):
                 try:
                     page.asarray(out=block[j])
                 except (TypeError, ValueError):
-                    block[j] = page.asarray()
+                    # ValueError here is ambiguous: either out= is unsupported
+                    # for this page, or the pixel data is short. Retrying
+                    # without out= separates them — a short file fails again.
+                    try:
+                        block[j] = page.asarray()
+                    except Exception as e:
+                        note_truncation(report, f, done + j, e)
+                        if j:
+                            yield block[:j]
+                            done += j
+                        return
                 j += 1
                 if j == block.shape[0]:
                     yield block
+                    done += j
                     j = 0
             if block is not None and j:
                 yield block[:j]
+                done += j
 
 
-def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB):
+def note_truncation(report, path, frame, why):
+    """Record + announce that a movie ended early. Loud on purpose: a short
+    file is usually an upload still in flight, and the fix is to finish the
+    upload and re-extract with --force, not to accept the salvage."""
+    msg = (f"  *** TRUNCATED: {Path(path).name} ends mid-frame at frame "
+           f"{frame} ({type(why).__name__}: {why}). Keeping the {frame} "
+           f"complete frames. If this file is still uploading, WAIT for it to "
+           f"finish and re-extract with --force — these traces are short. ***")
+    print(msg, flush=True)
+    if report is not None:
+        report.setdefault("truncated", []).append(
+            {"file": Path(path).name, "at_frame": int(frame),
+             "reason": f"{type(why).__name__}: {why}"})
+
+
+def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB, strict=False):
     files = run_tifs(run)
     bj = boxes_path(run)
     if not bj.exists():
@@ -553,7 +594,8 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB):
     tr_blocks, me_blocks = [], []
     prev = None                  # per-box float32 crop of the previous frame
     done, next_mark = 0, 2000
-    for block in stream_frame_blocks(files, batch_mb=batch_mb):
+    report = {}
+    for block in stream_frame_blocks(files, batch_mb=batch_mb, report=report):
         n = len(block)
         t_blk = np.empty((n_boxes, n), np.float32)
         m_blk = np.empty((n_boxes, n), np.float32)
@@ -581,13 +623,22 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB):
     motion = (np.concatenate(me_blocks, axis=1) if me_blocks
               else np.zeros((n_boxes, 0), np.float32))
 
+    trunc = report.get("truncated", [])
+    if trunc and strict:
+        print(f"[{run.name}] REFUSED (--strict-frames): movie is short — "
+              f"no traces written. Finish the upload / check the recording, "
+              f"then re-run.")
+        return None
+
     # atomic write: a job killed mid-save must never leave a plausible-looking npz
     tmp = out.with_name(out.name + ".tmp")
     with open(tmp, "wb") as fh:
         np.savez_compressed(fh, traces=traces, motion_energy=motion,
                             box_names=np.array(names), box_coords=coords,
                             files=np.array([f.name for f in files]), run=str(run),
-                            created=datetime.now().isoformat(timespec="seconds"))
+                            created=datetime.now().isoformat(timespec="seconds"),
+                            truncated=bool(trunc),
+                            truncated_info=json.dumps(trunc))
     os.replace(tmp, out)
     print(f"[{run.name}] wrote {out}  ({traces.shape[0]} boxes x {traces.shape[1]} frames)")
     try:
@@ -607,11 +658,16 @@ def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB):
             with open(mtmp, "wb") as fh:
                 savemat(fh, {"traces": traces, "motion_energy": motion,
                              "box_names": names, "box_coords": coords,
-                             "run": str(run)})
+                             "run": str(run), "truncated": bool(trunc),
+                             "truncated_info": json.dumps(trunc)})
             os.replace(mtmp, mat)
             print(f"[{run.name}] wrote {mat}")
         except ImportError:
             print("  (scipy not available — skipped .mat export)")
+    if trunc:
+        print(f"[{run.name}] NOTE: traces are marked truncated "
+              f"(npz key 'truncated') — re-extract with --force once the "
+              f"movie is complete.")
     return out
 
 
@@ -635,7 +691,7 @@ def cmd_extract(args):
         runs = [runs[args.run_index]]
     for run in runs:
         extract_run(run, save_mat=not args.no_mat, force=args.force,
-                    batch_mb=args.batch_mb)
+                    batch_mb=args.batch_mb, strict=args.strict_frames)
 
 
 # ------------------------------------------------------------ list / collect
@@ -652,6 +708,73 @@ def cmd_list(args):
     if args.save:
         Path(args.save).write_text("\n".join(str(r) for r in runs) + "\n")
         print(f"\nwrote {args.save} ({len(runs)} runs) — use with extract --runs-file")
+
+
+def verify_tif(path):
+    """Is this tif readable end-to-end? Returns (ok, n_frames, message).
+
+    Reads the FIRST and LAST frame only — enough to catch a file whose tail is
+    missing (upload still in flight, aborted recording) without paying to read
+    the middle. This is the cheap pre-flight for a tree that may still be
+    uploading; extraction itself salvages and flags, but finding short files
+    BEFORE a batch is much cheaper than after.
+    """
+    try:
+        with tifffile.TiffFile(str(path)) as tf:
+            mm = truncated_memmap(tf, str(path))
+            if mm is not None:
+                declared = None
+                try:
+                    ser = tf.series[0]
+                    declared = int(np.prod(
+                        ser.shape[:len(ser.shape) - len(tf.pages[0].shape)],
+                        dtype=np.int64))
+                except Exception:
+                    pass
+                if tf.is_imagej and tf.imagej_metadata:
+                    declared = max(declared or 0,
+                                   int(tf.imagej_metadata.get("images", 0)))
+                n = len(mm)
+                np.asarray(mm[0]), np.asarray(mm[-1])
+                del mm
+                if declared and n < declared:
+                    return False, n, f"SHORT: {n}/{declared} frames present"
+                return True, n, "ok"
+            n = len(tf.pages)
+            if n == 0:
+                return False, 0, "no readable pages"
+            tf.pages[0].asarray()
+            tf.pages[n - 1].asarray()
+            return True, n, "ok"
+    except Exception as e:
+        return False, -1, f"{type(e).__name__}: {e}"
+
+
+def cmd_verify(args):
+    """Check every tif under ROOTS for a missing tail. Exit 2 if any is short."""
+    runs = find_runs(args.roots)
+    bad, total_files = [], 0
+    for run in runs:
+        files = run_tifs(run)
+        total_files += len(files)
+        frames, run_bad = 0, []
+        for f in files:
+            ok, n, msg = verify_tif(f)
+            frames += max(n, 0)
+            if not ok:
+                run_bad.append((f, msg))
+        flag = "OK  " if not run_bad else "BAD "
+        print(f"{flag} {run}  ({len(files)} tifs, {frames} frames)")
+        for f, msg in run_bad:
+            print(f"       {f.name}: {msg}")
+        bad.extend((run, f, msg) for f, msg in run_bad)
+    print(f"\nChecked {total_files} tifs in {len(runs)} runs — "
+          f"{len(bad)} unreadable/short.")
+    if bad:
+        print("Short files are usually an upload still in flight. Wait for it "
+              "to finish, re-check, then extract (add --force to redo any run "
+              "already extracted from a short file).")
+        sys.exit(2)
 
 
 def cmd_collect(args):
@@ -701,9 +824,17 @@ def main():
     p.add_argument("--batch-mb", type=float, default=BATCH_MB,
                    help="frame-block read budget in MB — bounds extraction "
                         f"memory (default {BATCH_MB})")
+    p.add_argument("--strict-frames", action="store_true",
+                   help="refuse to write traces for a run whose movie is short "
+                        "(default: salvage the complete frames and flag them)")
     p.add_argument("--allow-local", action="store_true",
                    help="override the cluster-only trace policy (synthetic tests only)")
     p.set_defaults(fn=cmd_extract)
+
+    p = sub.add_parser("verify", help="check every tif for a missing tail "
+                                      "(upload still in flight / aborted recording)")
+    p.add_argument("roots", nargs="+")
+    p.set_defaults(fn=cmd_verify)
 
     p = sub.add_parser("list", help="show runs and processing status")
     p.add_argument("roots", nargs="+")

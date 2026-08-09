@@ -260,6 +260,18 @@ def pick_folder(start):
 
 # ------------------------------------------------------------------- phases
 
+def npz_is_truncated(run):
+    """Did this run's traces come from a movie that ended mid-frame?"""
+    npzs = sorted(proc_dir(run).glob("*_boxtraces.npz"))
+    if not npzs:
+        return False
+    try:
+        with np.load(npzs[0], allow_pickle=True) as d:
+            return bool(d["truncated"]) if "truncated" in d else False
+    except Exception:
+        return False
+
+
 def print_status(runs, header):
     print(f"\n{header}")
     print(f"{'idx':>3}  {'boxes':5} {'traces':6} {'sync':4}  run")
@@ -407,6 +419,9 @@ def main():
     ap.add_argument("--batch-mb", type=float, default=None,
                     help="extraction frame-block budget in MB (bounds memory; "
                          "default: box_extract_cluster's BATCH_MB)")
+    ap.add_argument("--strict-frames", action="store_true",
+                    help="refuse runs whose movie is short instead of "
+                         "salvaging the complete frames")
     ap.add_argument("--allow-local", action="store_true",
                     help="override the cluster-only trace policy (synthetic tests only)")
     args = ap.parse_args()
@@ -462,7 +477,7 @@ def main():
     for run in runs:
         try:
             extract_run(run, save_mat=not args.no_mat, force=args.force,
-                        batch_mb=batch_mb)
+                        batch_mb=batch_mb, strict=args.strict_frames)
         except Exception as e:
             print(f"[{run.name}] EXTRACT ERROR: {type(e).__name__}: {e} — "
                   f"continuing with remaining runs")
@@ -485,11 +500,19 @@ def main():
 
     done = [r for r in runs if list(proc_dir(r).glob("*_boxtraces.npz"))]
     missing = [r for r in runs if r not in set(done)]
+    truncated = [r for r in done if npz_is_truncated(r)]
     print_status(runs, "Final status")
 
     if missing:
         print(f"\n*** {len(missing)} runs have NO traces: "
               f"{', '.join(r.name for r in missing)} ***")
+    if truncated:
+        print(f"\n*** {len(truncated)} runs have TRUNCATED traces (movie ended "
+              f"mid-frame): {', '.join(r.name for r in truncated)} ***\n"
+              f"    Usually an upload still in flight. Check with:\n"
+              f"      python box_extract_cluster.py verify <folder>\n"
+              f"    then re-extract those runs with --force once complete.")
+    if missing or truncated:
         sys.exit(2)
     print("\nDone. Next: sync_detect_cluster.py per run (needs the t-series XML) — "
           "see ../03_synchronization.md.")

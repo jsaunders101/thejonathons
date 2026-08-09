@@ -70,6 +70,12 @@ Use it to catch misplaced boxes and drift BEFORE batching a day of data.
 ## Engineering properties you inherit (keep them true)
 - Idempotent: extract skips existing outputs; `--force` to redo
 - Atomic: npz/.mat written via tmp+rename — no partial outputs ever look complete
+- Short movies salvaged, never silently: a tif ending mid-frame (`failed to read N
+  bytes, got M` — usually an upload still in flight) stops reading at the last complete
+  frame, flags the npz (`truncated`), and makes the run exit 2. Frames are always a
+  contiguous prefix — never skip a bad frame and keep going, that shifts every later
+  camera-clock timestamp. Check a fresh upload with
+  `python box_extract_cluster.py verify /path/to/behavior` before batching.
 - Bounded memory: frames stream in blocks capped by `--batch-mb` (default 256 MB), so
   RAM is flat regardless of movie size. Single-IFD contiguous giants (ImageJ
   'truncated' >4 GB files) are read via `np.memmap` — note the earlier per-page
