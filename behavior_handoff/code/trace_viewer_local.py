@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-trace_viewer.py — play a behavior movie side-by-side with its extracted box traces.
+trace_viewer_local.py — play a behavior movie side-by-side with its extracted box traces.
 
 Left: the movie with the box overlays drawn on it. Right: one panel per box with
 the extracted trace and a red cursor that sweeps as the movie plays.
@@ -13,9 +13,9 @@ size open instantly and RAM stays flat. Display is spatially downsampled by --ds
 (default 2) for speed; the traces are untouched.
 
 Usage:
-  python trace_viewer.py "/path/to/run"                 # run folder (uses proc/)
-  python trace_viewer.py "/path/to/run" --trace motion  # plot motion energy
-  python trace_viewer.py "/path/to/run" --ds 4          # faster display
+  python trace_viewer_local.py "/path/to/run"                 # run folder (uses proc/)
+  python trace_viewer_local.py "/path/to/run" --trace motion  # plot motion energy
+  python trace_viewer_local.py "/path/to/run" --ds 4          # faster display
 """
 
 import argparse
@@ -26,28 +26,39 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from box_extract import run_tifs, to_gray, proc_dir, boxes_path  # noqa: E402
+from box_extract_local import (  # noqa: E402
+    run_tifs, to_gray, proc_dir, boxes_path, truncated_memmap)
 
 try:
     import tifffile
 except ImportError:
-    sys.exit("trace_viewer.py requires tifffile")
+    sys.exit("trace_viewer_local.py requires tifffile")
 
 
 class FrameSource:
-    """Random access into a run's concatenated tif stacks, one page at a time."""
+    """Random access into a run's concatenated tif stacks, one frame at a time.
+
+    Single-IFD contiguous giants (ImageJ 'truncated' >4 GB files) are indexed
+    via np.memmap so every frame is reachable, not just the first page."""
 
     def __init__(self, files):
         self.tfs = [tifffile.TiffFile(str(f)) for f in files]
+        self.mms = []
         self.index = []
-        for i, tf in enumerate(self.tfs):
-            self.index.extend((i, j) for j in range(len(tf.pages)))
+        for i, (f, tf) in enumerate(zip(files, self.tfs)):
+            mm = truncated_memmap(tf, str(f))
+            self.mms.append(mm)
+            n = len(mm) if mm is not None else len(tf.pages)
+            self.index.extend((i, j) for j in range(n))
 
     def __len__(self):
         return len(self.index)
 
     def get(self, k):
         i, j = self.index[k]
+        mm = self.mms[i]
+        if mm is not None:
+            return to_gray(mm[j])
         return to_gray(self.tfs[i].pages[j].asarray())
 
 
@@ -63,7 +74,7 @@ class Viewer:
 
         npzs = sorted(proc_dir(run).glob("*_boxtraces.npz"))
         if not npzs:
-            sys.exit(f"No *_boxtraces.npz in {proc_dir(run)} — run box_extract.py extract first.")
+            sys.exit(f"No *_boxtraces.npz in {proc_dir(run)} — run box_extract_local.py extract first.")
         d = np.load(npzs[0], allow_pickle=True)
         self.names = [str(n) for n in d["box_names"]]
         arr = d["traces"] if trace_kind == "intensity" else d["motion_energy"]
@@ -82,7 +93,7 @@ class Viewer:
 
         # ---- layout
         self.fig = plt.figure(figsize=(15, 8))
-        self.fig.canvas.manager.set_window_title(f"trace_viewer — {run.name}")
+        self.fig.canvas.manager.set_window_title(f"trace_viewer_local — {run.name}")
         self.ax_img = self.fig.add_axes([0.015, 0.16, 0.55, 0.80])
         frame = self.src.get(0)[::self.ds, ::self.ds]
         vmin, vmax = np.percentile(frame, [1, 99.5])

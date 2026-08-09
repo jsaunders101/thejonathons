@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-box_extract.py — box-ROI drawing (lightweight GUI) + per-box trace extraction
+box_extract_cluster.py — box-ROI drawing (lightweight GUI) + per-box trace extraction
 for behavior movies. Runs on the cluster; draw phase needs X-forwarding.
 
 Canonical box categories (edit CANONICAL_BOXES below to change the button set):
@@ -23,8 +23,8 @@ Every derived file lives in a proc/ subfolder INSIDE the run folder it came from
         boxes.json             box coords + categories
         <run>_boxtraces.npz    traces + motion_energy, n_boxes x n_frames
         <run>_boxtraces.mat    MATLAB copy (written by default)
-        <run>_sync.json        from sync_detect.py
-        <run>_syncqc.png       from sync_detect.py
+        <run>_sync.json        from sync_detect_cluster.py
+        <run>_syncqc.png       from sync_detect_cluster.py
 
 A "run" = any folder that directly contains one or more .tif/.tiff files; multiple
 tifs in a run are one movie, concatenated in natural-sort order.
@@ -33,7 +33,10 @@ Phases:
   draw     Interactive GUI, one first-frame per run (cheap). Writes <run>/proc/boxes.json.
            'reuse previous' button copies the last run's boxes. --boxes-from applies one
            boxes.json to every run with no GUI.
-  extract  Headless, streams every frame, writes <run>/proc/<run>_boxtraces.npz (+.mat).
+  extract  Headless, streams every frame in bounded blocks (--batch-mb, default
+           256 MB budget) so RAM stays flat on 80+ GB movies; single-IFD
+           contiguous giants (ImageJ 'truncated' >4 GB files) are read via
+           memmap. Writes <run>/proc/<run>_boxtraces.npz (+.mat).
            Parallelize with --run-index in a SLURM array.
   list     Show every run and its processing status (boxes / traces / sync).
   collect  Copy all proc/ outputs (NOT raw movies) into one flat folder ON THE
@@ -41,12 +44,12 @@ Phases:
            prefixing filenames with parent folders to stay unique.
 
 Examples:
-  python box_extract.py draw    /data/behavior/day1
-  python box_extract.py draw    /data/behavior --boxes-from /data/behavior/day1/run01/proc/boxes.json
-  python box_extract.py extract /data/behavior
-  python box_extract.py extract /data/behavior --run-index $SLURM_ARRAY_TASK_ID
-  python box_extract.py list    /data/behavior
-  python box_extract.py collect /data/behavior --dest /data/behavior/_collected
+  python box_extract_cluster.py draw    /data/behavior/day1
+  python box_extract_cluster.py draw    /data/behavior --boxes-from /data/behavior/day1/run01/proc/boxes.json
+  python box_extract_cluster.py extract /data/behavior
+  python box_extract_cluster.py extract /data/behavior --run-index $SLURM_ARRAY_TASK_ID
+  python box_extract_cluster.py list    /data/behavior
+  python box_extract_cluster.py collect /data/behavior --dest /data/behavior/_collected
 """
 
 import argparse
@@ -63,12 +66,19 @@ import numpy as np
 try:
     import tifffile
 except ImportError:
-    sys.exit("box_extract.py requires tifffile (pip install tifffile)")
+    sys.exit("box_extract_cluster.py requires tifffile (pip install tifffile)")
 
 CANONICAL_BOXES = ["laser_trigger", "whisker_pad", "paw", "paw_at_nose", "eye",
                    "nose", "wheel"]
 
 PROC = "proc"
+
+# The ONLY line that differs between the two branches of this code:
+# cluster/ ships "cluster" (trace writes guarded to Elzar), local/ ships "local"
+# (guard off — for local rigs and tests). Keep everything else byte-identical.
+DEPLOYMENT = "cluster"
+
+BATCH_MB = 256   # frame-block read budget (MB) — bounds extraction memory
 
 CLUSTER_ONLY_MSG = (
     "Trace writing is CLUSTER-ONLY (policy Aug 9): run extraction on Elzar, where "
@@ -80,7 +90,10 @@ CLUSTER_ONLY_MSG = (
 def trace_writes_allowed():
     """Cluster-only policy (Aug 9): trace outputs are written ONLY on the cluster.
     Detected via the /grid filesystem, a SLURM context, or an Elzar hostname;
-    M1AROUSAL_ALLOW_LOCAL=1 overrides (synthetic tests)."""
+    M1AROUSAL_ALLOW_LOCAL=1 overrides (synthetic tests). The local/ branch
+    (DEPLOYMENT="local") turns the guard off entirely."""
+    if DEPLOYMENT == "local":
+        return True
     if os.environ.get("M1AROUSAL_ALLOW_LOCAL"):
         return True
     if Path("/grid").exists():
@@ -415,36 +428,102 @@ def cmd_draw(args):
 
 # ------------------------------------------------------------- extract phase
 
-def stream_frames(files):
-    """Yield frames in NATIVE dtype, reusing one read buffer per file.
+def truncated_memmap(tf, path):
+    """np.memmap over a single-IFD tif that actually holds a whole movie, or None.
 
-    Callers must copy anything they keep across iterations — the buffer is
-    overwritten by the next frame.
+    Writers that keep one file per movie (ImageJ convention above 4 GB, some
+    ThorCam exports) emit ONE page header and append the remaining frames as raw
+    contiguous data. tifffile shows len(pages)==1 while series[0] knows the real
+    frame count; per-page streaming would silently yield a single frame. The
+    memmap makes every frame addressable while reading only the bytes touched.
+
+    The frame count is clamped to the bytes actually present, so an aborted
+    recording (metadata promises more frames than were written) yields the
+    frames that exist instead of failing.
+    """
+    try:
+        if len(tf.pages) != 1:
+            return None
+        p0 = tf.pages[0]
+        if (p0.dtype is None or not getattr(p0, "is_contiguous", False)
+                or int(getattr(p0, "compression", 1)) != 1):
+            return None
+        shape = tuple(p0.shape)
+        try:
+            ser = tf.series[0]
+            n = int(np.prod(ser.shape[:len(ser.shape) - len(shape)],
+                            dtype=np.int64))
+        except Exception:
+            n = 1
+        if tf.is_imagej and tf.imagej_metadata:
+            # on an aborted recording tifffile invalidates the whole series
+            # (shape collapses to one frame) but the declared count survives
+            # in the ImageJ tag; the byte clamp below trims it to reality
+            n = max(n, int(tf.imagej_metadata.get("images", 0)))
+        if n <= 1:
+            return None
+        dt = np.dtype(p0.dtype).newbyteorder(tf.byteorder)
+        offset = int(p0.dataoffsets[0])
+        fbytes = int(np.prod(shape, dtype=np.int64)) * dt.itemsize
+        avail = (os.path.getsize(path) - offset) // fbytes
+        if avail < 1:
+            return None
+        if avail < n:
+            print(f"  WARNING: {Path(path).name} declares {n} frames but only "
+                  f"{avail} are present (aborted recording?) — using {avail}")
+            n = int(avail)
+        return np.memmap(path, dtype=dt, mode="r", offset=offset,
+                         shape=(n,) + shape)
+    except Exception:
+        return None
+
+
+def stream_frame_blocks(files, batch_mb=BATCH_MB):
+    """Yield frame blocks (n, H, W[, C]) in NATIVE dtype, each <= batch_mb MB.
+
+    Bounded-memory streaming (OOM fix): extraction RAM is ~batch_mb regardless
+    of movie size, so 80+ GB runs stay flat. Two read paths:
+      - multi-page tifs (ThorCam parts): pages read one-by-one into a REUSED
+        block buffer
+      - single-IFD contiguous giants (see truncated_memmap): frames sliced
+        lazily off a memmap — only the bytes touched are read
+
+    Blocks and their views are invalidated by the next iteration — callers must
+    copy anything they keep.
     """
     for f in files:
         with tifffile.TiffFile(str(f)) as tf:
-            buf = None
+            mm = truncated_memmap(tf, str(f))
+            if mm is not None:
+                step = max(1, int(batch_mb * 2**20) // max(1, mm[0].nbytes))
+                for a in range(0, len(mm), step):
+                    yield mm[a:a + step]
+                del mm
+                continue
+            block, j = None, 0
             for page in tf.pages:
-                if buf is None or buf.shape != page.shape or buf.dtype != page.dtype:
-                    buf = np.empty(page.shape, page.dtype)
+                shape = tuple(page.shape)
+                if (block is None or block.shape[1:] != shape
+                        or block.dtype != page.dtype):
+                    if block is not None and j:
+                        yield block[:j]
+                    fbytes = (int(np.prod(shape, dtype=np.int64))
+                              * np.dtype(page.dtype).itemsize)
+                    n = max(1, int(batch_mb * 2**20) // max(1, fbytes))
+                    block, j = np.empty((n,) + shape, page.dtype), 0
                 try:
-                    yield page.asarray(out=buf)
+                    page.asarray(out=block[j])
                 except (TypeError, ValueError):
-                    yield page.asarray()
+                    block[j] = page.asarray()
+                j += 1
+                if j == block.shape[0]:
+                    yield block
+                    j = 0
+            if block is not None and j:
+                yield block[:j]
 
 
-def crop_f32(frame, coords):
-    """Cut boxes out of a native-dtype frame; return float32 COPIES (buffer-safe)."""
-    out = []
-    for x0, y0, x1, y1 in coords:
-        c = frame[y0:y1, x0:x1]
-        if c.ndim == 3:                         # RGB(A) safety — ThorCam is mono
-            c = c[..., :3].mean(axis=-1)
-        out.append(np.ascontiguousarray(c, dtype=np.float32))
-    return out
-
-
-def extract_run(run, save_mat=True, force=False):
+def extract_run(run, save_mat=True, force=False, batch_mb=BATCH_MB):
     files = run_tifs(run)
     bj = boxes_path(run)
     if not bj.exists():
@@ -465,22 +544,42 @@ def extract_run(run, save_mat=True, force=False):
 
     names = [b["name"] for b in boxes]
     coords = np.array([[b["x0"], b["y0"], b["x1"], b["y1"]] for b in boxes], dtype=int)
+    n_boxes = len(coords)
 
-    tr, me = [], []
-    prev = None
-    for i, frame in enumerate(stream_frames(files)):
-        crops = crop_f32(frame, coords)
-        tr.append([float(c.mean()) for c in crops])
-        if prev is None:
-            me.append([0.0] * len(crops))
-        else:
-            me.append([float(np.abs(c - p).mean()) for c, p in zip(crops, prev)])
-        prev = crops
-        if (i + 1) % 2000 == 0:
-            print(f"[{run.name}] {i + 1} frames...", flush=True)
+    # Batched streaming (OOM fix): per-box crops are cut from each block and
+    # reduced per frame. Reduction order matches the old per-frame loop exactly
+    # (row-wise pairwise mean over the contiguous crop), so values are
+    # bit-identical to the validated implementation.
+    tr_blocks, me_blocks = [], []
+    prev = None                  # per-box float32 crop of the previous frame
+    done, next_mark = 0, 2000
+    for block in stream_frame_blocks(files, batch_mb=batch_mb):
+        n = len(block)
+        t_blk = np.empty((n_boxes, n), np.float32)
+        m_blk = np.empty((n_boxes, n), np.float32)
+        new_prev = []
+        for b, (x0, y0, x1, y1) in enumerate(coords):
+            cb = block[:, y0:y1, x0:x1]
+            if cb.ndim == 4:                    # RGB(A) safety — ThorCam is mono
+                cb = cb[..., :3].mean(axis=-1)
+            cb = np.ascontiguousarray(cb, dtype=np.float32)
+            t_blk[b] = cb.reshape(n, -1).mean(axis=1)
+            if n > 1:
+                m_blk[b, 1:] = np.abs(cb[1:] - cb[:-1]).reshape(n - 1, -1).mean(axis=1)
+            m_blk[b, 0] = 0.0 if prev is None else float(np.abs(cb[0] - prev[b]).mean())
+            new_prev.append(cb[-1].copy())
+        prev = new_prev
+        tr_blocks.append(t_blk)
+        me_blocks.append(m_blk)
+        done += n
+        if done >= next_mark:
+            print(f"[{run.name}] {done} frames...", flush=True)
+            next_mark = done - done % 2000 + 2000
 
-    traces = np.asarray(tr, dtype=np.float32).T          # n_boxes x n_frames
-    motion = np.asarray(me, dtype=np.float32).T
+    traces = (np.concatenate(tr_blocks, axis=1) if tr_blocks
+              else np.zeros((n_boxes, 0), np.float32))   # n_boxes x n_frames
+    motion = (np.concatenate(me_blocks, axis=1) if me_blocks
+              else np.zeros((n_boxes, 0), np.float32))
 
     # atomic write: a job killed mid-save must never leave a plausible-looking npz
     tmp = out.with_name(out.name + ".tmp")
@@ -491,6 +590,14 @@ def extract_run(run, save_mat=True, force=False):
                             created=datetime.now().isoformat(timespec="seconds"))
     os.replace(tmp, out)
     print(f"[{run.name}] wrote {out}  ({traces.shape[0]} boxes x {traces.shape[1]} frames)")
+    try:
+        import resource
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peak_mb = peak / (2**20 if sys.platform == "darwin" else 2**10)
+        print(f"[{run.name}] peak RSS {peak_mb:.0f} MB (process high-water; "
+              f"batch budget {batch_mb:g} MB)")
+    except Exception:
+        pass
 
     if save_mat:
         try:
@@ -527,7 +634,8 @@ def cmd_extract(args):
             sys.exit(f"--run-index {args.run_index} out of range (found {len(runs)} runs)")
         runs = [runs[args.run_index]]
     for run in runs:
-        extract_run(run, save_mat=not args.no_mat, force=args.force)
+        extract_run(run, save_mat=not args.no_mat, force=args.force,
+                    batch_mb=args.batch_mb)
 
 
 # ------------------------------------------------------------ list / collect
@@ -590,6 +698,9 @@ def main():
     p.add_argument("--force", action="store_true", help="re-extract even if output exists")
     p.add_argument("--run-index", type=int, default=None,
                    help="process only the Nth run (0-based; for SLURM arrays)")
+    p.add_argument("--batch-mb", type=float, default=BATCH_MB,
+                   help="frame-block read budget in MB — bounds extraction "
+                        f"memory (default {BATCH_MB})")
     p.add_argument("--allow-local", action="store_true",
                    help="override the cluster-only trace policy (synthetic tests only)")
     p.set_defaults(fn=cmd_extract)

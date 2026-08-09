@@ -47,7 +47,7 @@ Do not rename these keys — MATLAB analysis and the (upcoming) bundle builder c
 
 ## Canonical box categories
 `laser_trigger, whisker_pad, paw, paw_at_nose, eye, nose, wheel` — edit
-`CANONICAL_BOXES` in box_extract.py only in coordination with the team (it changes
+`CANONICAL_BOXES` in box_extract_cluster.py only in coordination with the team (it changes
 every downstream label). `paw_at_nose` (added Aug 9): region in front of the snout
 where the paw appears during face-grooming — its intensity + ME report the
 'pawing at nose' motif. Existing runs drawn without it just warn as missing; to add

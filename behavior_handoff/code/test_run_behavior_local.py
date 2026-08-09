@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tests for run_behavior.py (headless; forces MPLBACKEND=Agg for subprocesses).
+"""Tests for run_behavior_local.py (headless; forces MPLBACKEND=Agg for subprocesses).
 
 1. Full headless chain on synthetic runs: --boxes-from + --no-view -> boxes written,
    traces extracted (npz + mat, correct names/shapes), exit 0.
@@ -10,9 +10,11 @@
    and skipped; the other runs still process; exit 2.
 5. --qc-png writes per-run *_tracesqc.png headlessly.
 6. probe_gui reports headless under Agg.
-7. FolderPicker logic under Agg: navigate down/up, pagination, select, cancel.
+7. backend_is_headless truth table (REGRESSION: '"agg" in "tkagg"' substring bug
+   classified working TkAgg sessions as headless).
+8. FolderPicker logic under Agg: navigate down/up, pagination, select, cancel.
 
-Run:  python test_run_behavior.py <workdir>
+Run:  python test_run_behavior_local.py <workdir>
 """
 
 import json
@@ -27,7 +29,7 @@ import tifffile
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-SCRIPT = Path(__file__).parent / "run_behavior.py"
+SCRIPT = Path(__file__).parent / "run_behavior_local.py"
 # M1AROUSAL_ALLOW_LOCAL: synthetic tests are the sanctioned exception to the
 # cluster-only trace policy
 ENV = {**os.environ, "MPLBACKEND": "Agg", "M1AROUSAL_ALLOW_LOCAL": "1"}
@@ -156,38 +158,53 @@ def test_cluster_guard(work, master, tmpl):
     env = {k: v for k, v in ENV.items() if k != "M1AROUSAL_ALLOW_LOCAL"}
     probe = subprocess.run(
         [sys.executable, "-c",
-         "import box_extract,sys; sys.exit(0 if box_extract.trace_writes_allowed() else 3)"],
+         "import box_extract_local,sys; sys.exit(0 if box_extract_local.trace_writes_allowed() else 3)"],
         env=env, cwd=str(SCRIPT.parent))
     if probe.returncode == 0:
-        print("SKIP  cluster guard (running ON the cluster — guard passes by design)")
+        print("SKIP  cluster guard (guard passes here by design: on the cluster, "
+              "or the DEPLOYMENT='local' branch)")
         return
     r = subprocess.run([sys.executable, str(SCRIPT), str(master),
                         "--boxes-from", str(tmpl), "--no-view"],
                        capture_output=True, text=True, env=env,
                        stdin=subprocess.DEVNULL)
     assert r.returncode != 0 and "CLUSTER-ONLY" in r.stdout + r.stderr
-    r = subprocess.run([sys.executable, str(SCRIPT.parent / "box_extract.py"),
+    r = subprocess.run([sys.executable, str(SCRIPT.parent / "box_extract_local.py"),
                         "extract", str(master)],
                        capture_output=True, text=True, env=env,
                        stdin=subprocess.DEVNULL)
     assert r.returncode != 0 and "CLUSTER-ONLY" in r.stdout + r.stderr
-    print("PASS  off-cluster trace writing refused (run_behavior + box_extract)")
+    print("PASS  off-cluster trace writing refused (run_behavior_local + box_extract_local)")
 
 
 def test_probe_gui():
     os.environ["MPLBACKEND"] = "Agg"
-    import run_behavior as rb
+    import run_behavior_local as rb
     rb._GUI.update(ok=None, why="")
     assert rb.probe_gui() is False
     assert "Agg" in rb._GUI["why"]
     print("PASS  probe_gui reports headless under Agg")
 
 
+def test_backend_classifier():
+    """REGRESSION (cluster, Aug 9): '"agg" in backend.lower()' is True for
+    "tkagg"/"qtagg", so working GUI sessions were declared headless. The fix is
+    an exact-name test — and NOT '"tkagg" not in backend', which would
+    misclassify MacOSX/QtAgg the same way."""
+    from run_behavior_local import backend_is_headless
+    for b in ("agg", "Agg", "cairo", "pdf", "pgf", "ps", "svg", "template"):
+        assert backend_is_headless(b), f"{b} should be headless"
+    for b in ("TkAgg", "tkagg", "QtAgg", "Qt5Agg", "MacOSX", "macosx",
+              "GTK3Agg", "GTK4Agg", "wxAgg", "nbAgg", "WebAgg"):
+        assert not backend_is_headless(b), f"{b} should count as a GUI backend"
+    print("PASS  backend classifier: exact-name set; TkAgg/QtAgg/MacOSX are GUI")
+
+
 def test_picker(work):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from run_behavior import FolderPicker
+    from run_behavior_local import FolderPicker
 
     tree = work / "picktree"
     (tree / "alpha" / "inner").mkdir(parents=True)
@@ -243,5 +260,6 @@ if __name__ == "__main__":
     test_failure_isolation(work, tmpl)
     test_cluster_guard(work, master, tmpl)
     test_probe_gui()
+    test_backend_classifier()
     test_picker(work)
     print("\nALL TESTS PASSED")

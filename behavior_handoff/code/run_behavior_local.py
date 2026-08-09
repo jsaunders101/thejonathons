@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-run_behavior.py — one-command behavior pipeline: pick a master folder in a dialog,
+run_behavior_local.py — one-command behavior pipeline: pick a master folder in a dialog,
 then box-draw -> extract -> review every run inside it.
 
-Wraps box_extract.py (draw + extract) and trace_viewer.py (validation) into a single
+Wraps box_extract_local.py (draw + extract) and trace_viewer_local.py (validation) into a single
 interactive flow. GUI availability is PROBED by actually opening a window, never
 guessed from env vars — so on a cluster (VS Code Remote-SSH, ssh -Y, OnDemand) it
 always TRIES, and degrades cleanly when a window can't open:
@@ -15,7 +15,7 @@ always TRIES, and degrades cleanly when a window can't open:
               across runs; --boxes-from applies one boxes.json everywhere, no GUI).
               Needs a working display — refuses with X11 remediation steps otherwise.
   4. EXTRACT + REVIEW, per run: streaming trace extraction (skips already-extracted;
-              --force), then trace_viewer opens IMMEDIATELY on that run's traces —
+              --force), then trace_viewer_local opens IMMEDIATELY on that run's traces —
               close the window to move to the next run, q to stop opening viewers.
               If a viewer can't open (headless, dead X connection), each run gets a
               static <run>/proc/<run>_tracesqc.png instead (first frame + boxes +
@@ -26,9 +26,9 @@ always TRIES, and degrades cleanly when a window can't open:
 Headless batch: give the folder + --boxes-from + --no-view (or --qc-png).
 
 Examples:
-  python run_behavior.py                                   # full interactive flow
-  python run_behavior.py /data/behavior/day1               # skip the dialog
-  python run_behavior.py /data/behavior \
+  python run_behavior_local.py                                   # full interactive flow
+  python run_behavior_local.py /data/behavior/day1               # skip the dialog
+  python run_behavior_local.py /data/behavior \
       --boxes-from /data/behavior/day1/run01/proc/boxes.json --qc-png
 """
 
@@ -42,9 +42,9 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from box_extract import (  # noqa: E402
-    CANONICAL_BOXES, CLUSTER_ONLY_MSG, BoxGUI, boxes_path, extract_run, find_runs,
-    natural_key, proc_dir, read_first_frame, run_tifs, save_boxes,
+from box_extract_local import (  # noqa: E402
+    BATCH_MB, CANONICAL_BOXES, CLUSTER_ONLY_MSG, BoxGUI, boxes_path, extract_run,
+    find_runs, natural_key, proc_dir, read_first_frame, run_tifs, save_boxes,
     trace_writes_allowed, validate_boxes)
 
 X11_HELP = """\
@@ -63,6 +63,17 @@ To get GUIs working on the cluster:
 
 _GUI = {"ok": None, "why": ""}
 
+# matplotlib's non-interactive backends, by exact name. Substring tests are a
+# trap here: "agg" is a substring of "tkagg"/"qtagg", which made working TkAgg
+# sessions classify as headless (bug found on the cluster, fixed Aug 9) — and
+# "tkagg not in backend" would misclassify MacOSX/QtAgg the same way.
+NON_INTERACTIVE_BACKENDS = {"agg", "cairo", "pdf", "pgf", "ps", "svg", "template"}
+
+
+def backend_is_headless(name):
+    """True if this matplotlib backend cannot open windows (exact-name test)."""
+    return name.lower() in NON_INTERACTIVE_BACKENDS
+
 
 def probe_gui():
     """Can we actually open a window? TRY once (create+close a figure) and cache.
@@ -77,16 +88,17 @@ def probe_gui():
         try:
             import matplotlib
             import matplotlib.pyplot as plt
-            if "agg" in matplotlib.get_backend().lower():
-                # pyplot fell back to Agg (usually DISPLAY unset) — try Tk, the
-                # backend the course envs ship. (Qt is not probed: a headless Qt
-                # can abort the process instead of raising.)
+            if backend_is_headless(matplotlib.get_backend()):
+                # pyplot fell back to a non-interactive backend (usually DISPLAY
+                # unset) — try Tk, the backend the course envs ship. (Qt is not
+                # probed: a headless Qt can abort the process instead of raising.)
                 try:
                     matplotlib.use("TkAgg", force=True)
                 except Exception:
                     pass
-            if "agg" in matplotlib.get_backend().lower():
-                why = "no interactive matplotlib backend (DISPLAY unset?)"
+            backend = matplotlib.get_backend()
+            if backend_is_headless(backend):
+                why = f"non-interactive matplotlib backend {backend!r} (DISPLAY unset?)"
             else:
                 fig = plt.figure(figsize=(1, 1))    # raises if the X link is dead
                 plt.close(fig)
@@ -122,7 +134,7 @@ class FolderPicker:
         self.fig = plt.figure(figsize=(8.5, 9.5))
         try:
             self.fig.canvas.manager.set_window_title(
-                "run_behavior — select master folder")
+                "run_behavior_local — select master folder")
         except Exception:
             pass
         self.ax = self.fig.add_axes([0.02, 0.13, 0.96, 0.83])
@@ -260,7 +272,7 @@ def print_status(runs, header):
 
 
 def phase_draw(runs, categories, boxes_from, redraw):
-    """box_extract's draw semantics: skip existing (unless redraw), template via
+    """box_extract_local's draw semantics: skip existing (unless redraw), template via
     --boxes-from, previous run's boxes offered as 'reuse previous'. A run whose
     first frame can't be read is reported and skipped, not fatal."""
     template = None
@@ -300,10 +312,10 @@ def phase_draw(runs, categories, boxes_from, redraw):
 
 
 def view_run(run, trace_kind, ds, stop):
-    """Open trace_viewer on one run, blocking until its window closes.
+    """Open trace_viewer_local on one run, blocking until its window closes.
     Pressing q sets stop['q'] so the caller stops opening further viewers."""
     import matplotlib.pyplot as plt
-    from trace_viewer import Viewer
+    from trace_viewer_local import Viewer
 
     print(f"[{run.name}] review — close window to continue, q to stop reviewing")
     viewer = Viewer(run, trace_kind=trace_kind, ds=ds)
@@ -317,7 +329,7 @@ def view_run(run, trace_kind, ds, stop):
 
 
 def save_trace_png(run, trace_kind="intensity", ds=2):
-    """Static stand-in for trace_viewer: first frame + box overlays beside per-box
+    """Static stand-in for trace_viewer_local: first frame + box overlays beside per-box
     traces -> <run>/proc/<stem>_tracesqc.png. Renders on an explicit Agg canvas, so
     it works with or without a display."""
     import matplotlib.patches as mpatches
@@ -392,6 +404,9 @@ def main():
     ap.add_argument("--trace", choices=["intensity", "motion"], default="intensity",
                     help="trace kind shown in review")
     ap.add_argument("--ds", type=int, default=2, help="review display downsample")
+    ap.add_argument("--batch-mb", type=float, default=None,
+                    help="extraction frame-block budget in MB (bounds memory; "
+                         "default: box_extract_local's BATCH_MB)")
     ap.add_argument("--allow-local", action="store_true",
                     help="override the cluster-only trace policy (synthetic tests only)")
     args = ap.parse_args()
@@ -443,9 +458,11 @@ def main():
         print("(review falls back to *_tracesqc.png files — open them in VS Code)")
     stop = {"q": False}
     print(f"\nExtracting {len(runs)} runs...")
+    batch_mb = args.batch_mb if args.batch_mb else BATCH_MB
     for run in runs:
         try:
-            extract_run(run, save_mat=not args.no_mat, force=args.force)
+            extract_run(run, save_mat=not args.no_mat, force=args.force,
+                        batch_mb=batch_mb)
         except Exception as e:
             print(f"[{run.name}] EXTRACT ERROR: {type(e).__name__}: {e} — "
                   f"continuing with remaining runs")
@@ -474,7 +491,7 @@ def main():
         print(f"\n*** {len(missing)} runs have NO traces: "
               f"{', '.join(r.name for r in missing)} ***")
         sys.exit(2)
-    print("\nDone. Next: sync_detect.py per run (needs the t-series XML) — "
+    print("\nDone. Next: sync_detect_local.py per run (needs the t-series XML) — "
           "see ../03_synchronization.md.")
 
 

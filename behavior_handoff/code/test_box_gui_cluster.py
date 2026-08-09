@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Headless regression tests for BoxGUI logic (run with MPLBACKEND=Agg).
 
-Usage:  MPLBACKEND=Agg python test_box_gui.py
+Usage:  MPLBACKEND=Agg python test_box_gui_cluster.py
 """
 import sys
 from pathlib import Path
@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
-from box_extract import BoxGUI, CANONICAL_BOXES  # noqa: E402
+from box_extract_cluster import BoxGUI, CANONICAL_BOXES  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 
 

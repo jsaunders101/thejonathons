@@ -26,6 +26,14 @@ The **box-ROI behavior extraction pipeline and its QC viewer** (`code/`). It is 
 end-to-end on real ThorCam data and is the team's working tool — treat it as trusted
 infrastructure to USE and extend carefully, not to rewrite.
 
+**Two versions of every script.** `*_cluster.py` (run these on Elzar; trace writing is
+guarded to the cluster) and `*_local.py` (run these on your own machine; guard off).
+The code is otherwise identical — the suffix is the only difference, and a
+`CLUSTER-ONLY` exit means you picked the wrong twin. Commands below say `_cluster`;
+substitute `_local` when you are off-cluster. If you change one version, change the
+other identically — the owner's repo has `check_branches.py`, which fails on any
+divergence beyond the branch name.
+
 **Explicitly out of scope:** 2P↔camera synchronization (`sync_detect.py`), run↔t-series
 pairing, sniff processing, and bundle building. That code exists on the owner's side and is
 still being refined — do NOT build your own version; coordinate with Seneca
@@ -38,7 +46,7 @@ cannot show the 2P laser-onset brightness step that sync detection depends on).
    came from. Raw tif folders are never written to. A "run" = any folder directly containing
    ≥1 .tif; multiple tifs in a run are ONE movie, concatenated in natural-sort order.
 2. **Canonical box categories** — `laser_trigger, whisker_pad, paw, paw_at_nose, eye, nose, wheel`
-   (`CANONICAL_BOXES` in box_extract.py). One box per category, enforced (duplicates
+   (`CANONICAL_BOXES` in box_extract_cluster.py). One box per category, enforced (duplicates
    hard-error). Do not rename categories or npz keys (`traces`, `motion_energy`, `box_names`,
    `box_coords`) — MATLAB analysis and the bundle builder consume them as-is.
 3. **Outputs are idempotent and atomic** — extraction skips existing outputs (`--force` to
@@ -52,21 +60,27 @@ cannot show the 2P laser-onset brightness step that sync detection depends on).
 - On a SLURM cluster: freeze the run list first (`list --save runs.txt`), then array-index it
   (`extract --runs-file runs.txt --run-index $SLURM_ARRAY_TASK_ID`). Never let array tasks
   re-scan a directory tree that may still be uploading. ~4G memory is generous (streaming).
-- Before changing box_extract.py, run the regression suite:
-  `MPLBACKEND=Agg python test_box_gui.py` — and keep it passing. If you fix a bug, add a check.
+- Before changing box_extract_cluster.py, run the regression suites:
+  `MPLBACKEND=Agg python test_box_gui_cluster.py` and
+  `MPLBACKEND=Agg python test_extract_stream_cluster.py /tmp/es_test` — and keep them
+  passing. If you fix a bug, add a check. The extraction suite pins trace values
+  bit-exactly against the original per-frame implementation: if it fails, your change
+  altered the science, not just the plumbing.
+- Extraction streams in bounded blocks (`--batch-mb`, default 256 MB) so 80+ GB movies
+  don't OOM; don't replace it with a whole-movie load.
 - macOS-uploaded data contains `._*` AppleDouble junk; discovery already filters it — don't
   weaken that.
-- QC is mandatory, not optional: after extraction, spot-check runs in trace_viewer.py
+- QC is mandatory, not optional: after extraction, spot-check runs in trace_viewer_cluster.py
   (movie + traces side by side) before trusting any downstream analysis. Zoom (toolbar
   magnifier) before drawing boxes — at full-frame scale, facial features are easy to
   misidentify (a real mistake that cost this team an hour: an eye labeled as a nose).
 
 ## Quick command reference
 ```
-python box_extract.py draw    <roots>                  # GUI: drag box → click category button
-python box_extract.py draw    <roots> --boxes-from <run>/proc/boxes.json   # no GUI, reuse boxes
-python box_extract.py extract <roots> [--force]        # stream movies → proc/*_boxtraces.npz + .mat
-python box_extract.py list    <roots> [--save runs.txt]
-python box_extract.py collect <roots> --dest <dir>     # stage proc outputs (never raw movies)
-python trace_viewer.py <run> [--trace motion] [--ds 4] # movie + traces QC playback
+python box_extract_cluster.py draw    <roots>                  # GUI: drag box → click category button
+python box_extract_cluster.py draw    <roots> --boxes-from <run>/proc/boxes.json   # no GUI, reuse boxes
+python box_extract_cluster.py extract <roots> [--force]        # stream movies → proc/*_boxtraces.npz + .mat
+python box_extract_cluster.py list    <roots> [--save runs.txt]
+python box_extract_cluster.py collect <roots> --dest <dir>     # stage proc outputs (never raw movies)
+python trace_viewer_cluster.py <run> [--trace motion] [--ds 4] # movie + traces QC playback
 ```
