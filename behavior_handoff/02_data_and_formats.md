@@ -46,8 +46,13 @@ y = row, origin top-left). One box per category — duplicates hard-error at ext
 Do not rename these keys — MATLAB analysis and the (upcoming) bundle builder consume them.
 
 ## Canonical box categories
-`laser_trigger, whisker_pad, paw, eye, nose, wheel` — edit `CANONICAL_BOXES` in
-box_extract.py only in coordination with the team (it changes every downstream label).
+`laser_trigger, whisker_pad, paw, paw_at_nose, eye, nose, wheel` — edit
+`CANONICAL_BOXES` in box_extract.py only in coordination with the team (it changes
+every downstream label). `paw_at_nose` (added Aug 9): region in front of the snout
+where the paw appears during face-grooming — its intensity + ME report the
+'pawing at nose' motif. Existing runs drawn without it just warn as missing; to add
+it, redraw with `--overwrite` (the GUI seeds `reuse previous` with the run's own
+boxes, so it's one click + one new box) and re-extract with `--force`.
 `laser_trigger` must sit on a **non-saturated** region: it exists to capture the 2P
 laser-onset brightness step used by the (excluded) sync stage, and a clipped-white box
 cannot show a step.

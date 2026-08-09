@@ -1,5 +1,23 @@
 # Behavior pipeline: usage & status
 
+## run_behavior.py — one-command flow (NEW)
+
+Master wrapper: folder dialog → draw → per-run extract with the trace viewer opening
+immediately after each run's extraction (close window = next run; `q` = stop viewers).
+GUI availability is probed by actually opening a window, then degrades cleanly:
+dialog falls back Tk → matplotlib browser → typed path; review falls back to static
+`<run>/proc/*_tracesqc.png` files (`--qc-png` forces them). Failing runs are isolated
+and reported; the rest still process. For cluster GUIs use an Elzar OnDemand
+interactive Desktop session (native windows, no X forwarding).
+
+```bash
+python run_behavior.py                          # full interactive flow
+python run_behavior.py /data/behavior           # skip the dialog
+python run_behavior.py /data/behavior --boxes-from <run>/proc/boxes.json --qc-png
+```
+
+Tests: `MPLBACKEND=Agg python test_run_behavior.py /tmp/rb_test` (12 checks).
+
 ## box_extract.py — two phases
 
 **draw** (interactive; needs a display; reads ONE frame per run, so it's cheap anywhere):

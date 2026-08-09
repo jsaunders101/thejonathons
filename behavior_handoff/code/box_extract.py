@@ -4,7 +4,11 @@ box_extract.py — box-ROI drawing (lightweight GUI) + per-box trace extraction
 for behavior movies. Runs on the cluster; draw phase needs X-forwarding.
 
 Canonical box categories (edit CANONICAL_BOXES below to change the button set):
-    laser_trigger, whisker_pad, paw, eye, nose, wheel
+    laser_trigger, whisker_pad, paw, paw_at_nose, eye, nose, wheel
+
+paw_at_nose = box over the region in front of the snout where the paw appears
+during face-grooming bouts; intensity + motion energy there report the
+'pawing at nose' motif.
 
 GUI: drag a rectangle on the first frame, then CLICK THE CATEGORY BUTTON to assign
 it. No typing -> no naming typos. One box per category, enforced (assigning a
@@ -60,7 +64,8 @@ try:
 except ImportError:
     sys.exit("box_extract.py requires tifffile (pip install tifffile)")
 
-CANONICAL_BOXES = ["laser_trigger", "whisker_pad", "paw", "eye", "nose", "wheel"]
+CANONICAL_BOXES = ["laser_trigger", "whisker_pad", "paw", "paw_at_nose", "eye",
+                   "nose", "wheel"]
 
 PROC = "proc"
 
@@ -368,6 +373,10 @@ def cmd_draw(args):
             print(f"[{run.name}] proc/boxes.json exists, skipping (--overwrite to redo).")
             prev = json.loads(bj.read_text())["boxes"]
             continue
+        if bj.exists():
+            # overwriting: seed 'reuse previous' with this run's OWN boxes, so adding
+            # a new category = one click to restore the old boxes + draw the new one
+            prev = json.loads(bj.read_text())["boxes"]
         frame = read_first_frame(files[0])
         if args.boxes_from:
             save_boxes(run, files, [dict(b) for b in template], frame.shape, categories)

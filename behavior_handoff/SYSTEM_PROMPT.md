@@ -37,7 +37,7 @@ cannot show the 2P laser-onset brightness step that sync detection depends on).
 1. **The proc/ contract.** Every derived file lives in `<run>/proc/` inside the run folder it
    came from. Raw tif folders are never written to. A "run" = any folder directly containing
    ≥1 .tif; multiple tifs in a run are ONE movie, concatenated in natural-sort order.
-2. **Canonical box categories** — `laser_trigger, whisker_pad, paw, eye, nose, wheel`
+2. **Canonical box categories** — `laser_trigger, whisker_pad, paw, paw_at_nose, eye, nose, wheel`
    (`CANONICAL_BOXES` in box_extract.py). One box per category, enforced (duplicates
    hard-error). Do not rename categories or npz keys (`traces`, `motion_energy`, `box_names`,
    `box_coords`) — MATLAB analysis and the bundle builder consume them as-is.
