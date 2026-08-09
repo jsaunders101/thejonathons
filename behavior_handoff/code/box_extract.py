@@ -70,6 +70,26 @@ CANONICAL_BOXES = ["laser_trigger", "whisker_pad", "paw", "paw_at_nose", "eye",
 
 PROC = "proc"
 
+CLUSTER_ONLY_MSG = (
+    "Trace writing is CLUSTER-ONLY (policy Aug 9): run extraction on Elzar, where "
+    "the data lives. Any traces written elsewhere are vestigial tests — do not "
+    "analyze them. Override for synthetic tests only: --allow-local or "
+    "M1AROUSAL_ALLOW_LOCAL=1.")
+
+
+def trace_writes_allowed():
+    """Cluster-only policy (Aug 9): trace outputs are written ONLY on the cluster.
+    Detected via the /grid filesystem, a SLURM context, or an Elzar hostname;
+    M1AROUSAL_ALLOW_LOCAL=1 overrides (synthetic tests)."""
+    if os.environ.get("M1AROUSAL_ALLOW_LOCAL"):
+        return True
+    if Path("/grid").exists():
+        return True
+    if any(k.startswith("SLURM_") for k in os.environ):
+        return True
+    import socket
+    return socket.gethostname().lower().startswith(("bam", "elzar"))
+
 
 # ---------------------------------------------------------------- discovery
 
@@ -489,6 +509,8 @@ def extract_run(run, save_mat=True, force=False):
 
 
 def cmd_extract(args):
+    if not (trace_writes_allowed() or args.allow_local):
+        sys.exit(CLUSTER_ONLY_MSG)
     if args.runs_file:
         # frozen run list from `list --save`: array tasks index a fixed file, so a
         # tree that is still uploading can never shift indices between jobs
@@ -568,6 +590,8 @@ def main():
     p.add_argument("--force", action="store_true", help="re-extract even if output exists")
     p.add_argument("--run-index", type=int, default=None,
                    help="process only the Nth run (0-based; for SLURM arrays)")
+    p.add_argument("--allow-local", action="store_true",
+                   help="override the cluster-only trace policy (synthetic tests only)")
     p.set_defaults(fn=cmd_extract)
 
     p = sub.add_parser("list", help="show runs and processing status")

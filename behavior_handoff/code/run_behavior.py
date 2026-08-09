@@ -43,8 +43,9 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).parent))
 from box_extract import (  # noqa: E402
-    CANONICAL_BOXES, BoxGUI, boxes_path, extract_run, find_runs, natural_key,
-    proc_dir, read_first_frame, run_tifs, save_boxes, validate_boxes)
+    CANONICAL_BOXES, CLUSTER_ONLY_MSG, BoxGUI, boxes_path, extract_run, find_runs,
+    natural_key, proc_dir, read_first_frame, run_tifs, save_boxes,
+    trace_writes_allowed, validate_boxes)
 
 X11_HELP = """\
 To get GUIs working on the cluster:
@@ -391,7 +392,12 @@ def main():
     ap.add_argument("--trace", choices=["intensity", "motion"], default="intensity",
                     help="trace kind shown in review")
     ap.add_argument("--ds", type=int, default=2, help="review display downsample")
+    ap.add_argument("--allow-local", action="store_true",
+                    help="override the cluster-only trace policy (synthetic tests only)")
     args = ap.parse_args()
+
+    if not (trace_writes_allowed() or args.allow_local):
+        sys.exit(CLUSTER_ONLY_MSG)
 
     categories = ([c.strip() for c in args.categories.split(",")]
                   if args.categories else CANONICAL_BOXES)

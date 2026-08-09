@@ -28,7 +28,9 @@ import tifffile
 sys.path.insert(0, str(Path(__file__).parent))
 
 SCRIPT = Path(__file__).parent / "run_behavior.py"
-ENV = {**os.environ, "MPLBACKEND": "Agg"}
+# M1AROUSAL_ALLOW_LOCAL: synthetic tests are the sanctioned exception to the
+# cluster-only trace policy
+ENV = {**os.environ, "MPLBACKEND": "Agg", "M1AROUSAL_ALLOW_LOCAL": "1"}
 
 TEMPLATE_BOXES = [
     {"name": "laser_trigger", "x0": 1, "y0": 1, "x1": 10, "y1": 8},
@@ -148,6 +150,30 @@ def test_failure_isolation(work, tmpl):
     print("PASS  corrupt runs isolated (draw + extract), good runs still processed, exit 2")
 
 
+def test_cluster_guard(work, master, tmpl):
+    """Off-cluster, without the override, trace writing must refuse (both entry
+    points). Skipped when actually on a cluster (guard would legitimately pass)."""
+    env = {k: v for k, v in ENV.items() if k != "M1AROUSAL_ALLOW_LOCAL"}
+    probe = subprocess.run(
+        [sys.executable, "-c",
+         "import box_extract,sys; sys.exit(0 if box_extract.trace_writes_allowed() else 3)"],
+        env=env, cwd=str(SCRIPT.parent))
+    if probe.returncode == 0:
+        print("SKIP  cluster guard (running ON the cluster — guard passes by design)")
+        return
+    r = subprocess.run([sys.executable, str(SCRIPT), str(master),
+                        "--boxes-from", str(tmpl), "--no-view"],
+                       capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL)
+    assert r.returncode != 0 and "CLUSTER-ONLY" in r.stdout + r.stderr
+    r = subprocess.run([sys.executable, str(SCRIPT.parent / "box_extract.py"),
+                        "extract", str(master)],
+                       capture_output=True, text=True, env=env,
+                       stdin=subprocess.DEVNULL)
+    assert r.returncode != 0 and "CLUSTER-ONLY" in r.stdout + r.stderr
+    print("PASS  off-cluster trace writing refused (run_behavior + box_extract)")
+
+
 def test_probe_gui():
     os.environ["MPLBACKEND"] = "Agg"
     import run_behavior as rb
@@ -215,6 +241,7 @@ if __name__ == "__main__":
     master, tmpl = test_chain(work)
     test_degrade_chain(work, master, tmpl)
     test_failure_isolation(work, tmpl)
+    test_cluster_guard(work, master, tmpl)
     test_probe_gui()
     test_picker(work)
     print("\nALL TESTS PASSED")
