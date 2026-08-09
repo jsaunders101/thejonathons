@@ -76,5 +76,7 @@ Use it to catch misplaced boxes and drift BEFORE batching a day of data.
 - Real data (3×1 GB ThorCam, 1035 frames): GUI, extraction, .mat load, viewer — pass
 - GUI regression suite: `MPLBACKEND=Agg python test_box_gui.py` → 9 checks, incl. the
   stale-selection duplicate-box bug caught on real data
-- Untested: draw GUI over `ssh -Y` (X-forwarding); if laggy, draw locally on downloaded
-  first frames and push boxes.json back with `--boxes-from`
+- Untested: GUIs on the cluster — planned route is an **Elzar OnDemand interactive
+  Desktop session** (native windows; run run_behavior.py in its terminal). `ssh -Y`
+  X-forwarding is the fallback. Everything stays on the cluster — draw there, not on
+  laptops (policy: no local copies of data or outputs).

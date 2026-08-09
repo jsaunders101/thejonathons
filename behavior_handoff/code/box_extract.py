@@ -36,8 +36,9 @@ Phases:
   extract  Headless, streams every frame, writes <run>/proc/<run>_boxtraces.npz (+.mat).
            Parallelize with --run-index in a SLURM array.
   list     Show every run and its processing status (boxes / traces / sync).
-  collect  Copy all proc/ outputs (NOT raw movies) into one flat folder for download
-           to local MATLAB, prefixing filenames with parent folders to stay unique.
+  collect  Copy all proc/ outputs (NOT raw movies) into one flat folder ON THE
+           CLUSTER (staging for slides/sharing — nothing leaves the cluster),
+           prefixing filenames with parent folders to stay unique.
 
 Examples:
   python box_extract.py draw    /data/behavior/day1
@@ -524,7 +525,8 @@ def cmd_list(args):
 
 
 def cmd_collect(args):
-    """Copy proc/ outputs (never raw movies) into one flat folder for local download."""
+    """Copy proc/ outputs (never raw movies) into one flat CLUSTER folder
+    (staging for slides/sharing — outputs never leave the cluster)."""
     runs = find_runs(args.roots)
     dest = Path(args.dest)
     dest.mkdir(parents=True, exist_ok=True)

@@ -57,8 +57,8 @@ To get GUIs working on the cluster:
         ForwardX11Trusted yes
     start XQuartz, then fully reconnect the VS Code window; check with: echo $DISPLAY
   - compute nodes only get a display via  srun --x11  (if the site enables it)
-  - no display at all: draw boxes locally, rerun with --boxes-from <boxes.json>;
-    review via the *_tracesqc.png files (--qc-png)."""
+  - no display at all: run headless with --boxes-from <boxes.json> (draw the boxes
+    in a desktop session first); review via the *_tracesqc.png files (--qc-png)."""
 
 _GUI = {"ok": None, "why": ""}
 
