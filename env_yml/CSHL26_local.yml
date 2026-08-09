@@ -1,0 +1,21 @@
+name: CSHL26_local
+
+channels:
+  - conda-forge
+
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - scikit-image
+  - imageio
+  - tifffile
+  - pandas
+  - ipykernel
+  - notebook
+  - nbformat
+  - pip
+  - pip:
+      - plotly
+      - tqdm
