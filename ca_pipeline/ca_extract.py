@@ -65,6 +65,13 @@ PARAMS_DEFAULT = {
                                  # cross-correlation) measured ~10x more accurate than
                                  # skimage's default "phase" on ground-truth synthetic
                                  # 2P-like data (0.06 vs 0.6 px RMS) — see test suite
+    "detect_bin_frames": "auto", # temporal binning for DETECTION ONLY (corr map + ROI
+                                 # growth). Raw resonant-scan frames are shot-noise
+                                 # dominated -> neighbor correlations collapse (~0.1-0.2
+                                 # even over cells). Binning restores them; final traces
+                                 # are ALWAYS extracted from the full-rate movie.
+                                 # "auto" = bin to ~6 Hz (round(fps/6)); int to override;
+                                 # 1 disables.
     "corr_threshold": 0.3,       # ROI growth: pixel-vs-ROI-trace correlation
     "size_range": [15, 100],     # accept ROIs within this pixel count (exclusive)
     "size_threshold": 200,       # hard stop for region growth
@@ -357,20 +364,31 @@ def next_roi(corr_map, mov, corr_threshold, size_threshold):
     return this_roi, this_trace, int(this_roi.sum()), this_corr_map
 
 
-def extract_rois(corr_map, mov, p):
-    traces, npix, roi_map = [], [], np.zeros(corr_map.shape, dtype=np.uint16)
+def bin_movie(mov, n):
+    """Mean over non-overlapping blocks of n frames (detection movie)."""
+    if n <= 1:
+        return mov
+    T = (len(mov) // n) * n
+    return mov[:T].reshape(-1, n, *mov.shape[1:]).mean(axis=1)
+
+
+def extract_rois(corr_map, detect_mov, full_mov, p):
+    """Grow ROIs on the (possibly binned) DETECTION movie; extract each accepted ROI's
+    trace from the FULL-RATE movie as the sum over its member pixels."""
+    npix, roi_map = [], np.zeros(corr_map.shape, dtype=np.uint16)
+    masks = []
     used = corr_map.copy()
     label = 0
     for _ in range(p["n_rois"]):
-        roi, trace, size, used = next_roi(used, mov, p["corr_threshold"],
-                                          p["size_threshold"])
+        roi, _, size, used = next_roi(used, detect_mov, p["corr_threshold"],
+                                      p["size_threshold"])
         if p["size_range"][0] < size < p["size_range"][1]:
             label += 1
-            traces.append(trace)
+            masks.append(roi.astype(bool))
             npix.append(size)
             roi_map[roi.astype(bool)] = label
-    F = np.asarray(traces, dtype=np.float32) if traces else np.zeros((0, len(mov)),
-                                                                     np.float32)
+    F = (np.stack([full_mov[:, m].sum(axis=1) for m in masks]).astype(np.float32)
+         if masks else np.zeros((0, len(full_mov)), np.float32))
     return F, np.asarray(npix, dtype=int), roi_map
 
 
@@ -459,15 +477,21 @@ def process_tseries(ts, data_root, out_root, params, force=False):
     total2 = np.sqrt(y2 ** 2 + x2 ** 2)
     del mov
 
-    print(f"[{ts.name}] correlation map...")
-    cmap_full = neighbor_corr_map(final)
+    nb = params["detect_bin_frames"]
+    if nb == "auto":
+        nb = max(1, int(round(meta["fps"] / 6.0)))
+    detect = bin_movie(final, nb)
+    print(f"[{ts.name}] correlation map (detection binned x{nb} -> "
+          f"{len(detect)} frames)...")
+    cmap_full = neighbor_corr_map(detect)
     border = max(params["border_px"], int(np.ceil(np.abs([y2, x2]).max())) + 1)
     cmap = cmap_full.copy()
     cmap[:border, :] = 0; cmap[-border:, :] = 0
     cmap[:, :border] = 0; cmap[:, -border:] = 0
-
-    print(f"[{ts.name}] ROI extraction...")
-    F, npix, roi_map = extract_rois(cmap, final, params)
+    print(f"[{ts.name}] corr map max {cmap.max():.2f}; ROI extraction...")
+    F, npix, roi_map = extract_rois(cmap, detect, final, params)
+    if nb > 1:
+        del detect
     dff, F0 = compute_dff(F, params["dff_percentile"])
     xy = roi_centroids(roi_map, len(F))
     del final
@@ -475,6 +499,7 @@ def process_tseries(ts, data_root, out_root, params, force=False):
     flags = {
         "motion": bool(np.percentile(total2, 99) > params["flag_max_shift_px"]),
         "few_rois": bool(len(F) < params["flag_min_rois"]),
+        "weak_corr_map": bool(cmap.max() < params["corr_threshold"]),
         "frame_period_jitter": bool(np.std(np.diff(rel_t)) > 0.1 * meta["frame_period_s"]),
     }
     qc = {
@@ -482,6 +507,8 @@ def process_tseries(ts, data_root, out_root, params, force=False):
         "shift_p99_px": float(np.percentile(total2, 99)),
         "shift_max_px": float(total2.max()),
         "border_px_used": int(border),
+        "corr_map_max": float(cmap.max()),
+        "detect_bin_frames_used": int(nb),
         "flags": flags,
         "flagged": any(flags.values()),
     }

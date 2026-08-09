@@ -110,6 +110,40 @@ def test_next_roi_equivalence():
     print(f"PASS  next_roi == notebook implementation (ROI of {s1} px identical)")
 
 
+def test_noisy_detection_binning():
+    """Reproduces the real-data symptom (Aug 9): shot-noise-dominated raw frames ->
+    neighbor correlations collapse to ~0.2 even over cells -> 0 ROIs at threshold 0.3.
+    Temporal binning for detection recovers the cells; traces come from full rate."""
+    cells = ((12, 12), (28, 30))
+    mov, sigs = make_cell_movie(T=900, Y=40, X=44, cells=cells, noise=90.0)
+    p = dict(cx.PARAMS_DEFAULT, size_range=[10, 300], size_threshold=300)
+
+    raw_cmap = cx.neighbor_corr_map(mov)
+    raw_at_cells = max(raw_cmap[cy, cx_] for cy, cx_ in cells)
+    binned = cx.bin_movie(mov, 10)
+    bin_cmap = cx.neighbor_corr_map(binned)
+    bin_at_cells = max(bin_cmap[cy, cx_] for cy, cx_ in cells)
+    assert raw_at_cells < 0.3 < bin_at_cells, (raw_at_cells, bin_at_cells)
+
+    for cm in (raw_cmap, bin_cmap):
+        cm[:2] = 0; cm[-2:] = 0; cm[:, :2] = 0; cm[:, -2:] = 0
+    F_raw_only, _, _ = cx.extract_rois(raw_cmap, mov, mov, p)
+    F_bin, npix, roi_map = cx.extract_rois(bin_cmap, binned, mov, p)
+    assert len(F_bin) >= 2 > len(F_raw_only), (len(F_raw_only), len(F_bin))
+    assert F_bin.shape[1] == 900                    # traces at FULL rate
+    xy = cx.roi_centroids(roi_map, len(F_bin))
+    hits = 0
+    for k, (cy, cx_) in enumerate(cells):
+        d = np.hypot(xy[:, 0] - cx_, xy[:, 1] - cy)
+        if d.min() < 4:
+            r = cx.fast_pearson(F_bin[int(np.argmin(d))].astype(float), sigs[k])
+            assert r > 0.6, r
+            hits += 1
+    assert hits == 2
+    print(f"PASS  noisy-data binning: corr@cells {raw_at_cells:.2f} unbinned (fails) -> "
+          f"{bin_at_cells:.2f} binned; {len(F_bin)} ROIs, full-rate traces recovered")
+
+
 def write_synthetic_tseries(ts_dir, name, T=300, Y=64, X=64, fps=30.0,
                             drift_px=3.0, cells=((20, 18), (44, 40), (30, 50))):
     """Bruker-style folder: XML with Frames+PVStateShard, movie split across 3 ome.tifs,
@@ -241,5 +275,6 @@ if __name__ == "__main__":
     test_pearson_equivalence()
     test_corrmap_equivalence()
     test_next_roi_equivalence()
+    test_noisy_detection_binning()
     test_end_to_end(work)
     print("\nALL TESTS PASSED")
