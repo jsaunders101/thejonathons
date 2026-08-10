@@ -88,7 +88,6 @@ from pathlib import Path
 OUT_DIR = Path("{TMP}/out_A")
 RUNS = {{"A": dict(beh=r"{beh}", ca=r"{ca}", on={on}, off={off},
                    tseries_fps={P2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns = run_notebook(cfg)
@@ -153,7 +152,6 @@ from pathlib import Path
 OUT_DIR = Path("{TMP}/out_C")
 RUNS = {{"C": dict(beh=r"{demo}", ca=r"{ca_d}", on={on_d}, off={off_d},
                    tseries_fps={P2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
     ns_c = run_notebook(cfg)
@@ -184,7 +182,6 @@ from pathlib import Path
 OUT_DIR = Path("{TMP}/out_C2")
 RUNS = {{"C2": dict(beh=r"{proc}", ca=r"{ca}", on={on}, off={off},
                     tseries_fps={P2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns2 = run_notebook(cfg)
@@ -200,7 +197,6 @@ from pathlib import Path
 OUT_DIR = Path("{TMP}/out_C3")
 RUNS = {{"C3": dict(beh=r"{proc / "run1_behavior_boxtraces_with_time.npz"}", ca=r"{ca}",
                     on={on}, off={off}, tseries_fps={P2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns3 = run_notebook(cfg)
@@ -213,7 +209,6 @@ cfg = f'''
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_C4")
 RUNS = {{"C4": dict(beh=r"{proc}", ca=r"{ca}", on={on}, off={off}, tseries_fps={P2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns4 = run_notebook(cfg)
@@ -247,7 +242,6 @@ for label, mod in cases.items():
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_D")
 RUNS = {{"D": {c!r}}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
     ns_d = run_notebook(cfg)
@@ -255,21 +249,24 @@ ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
           ns_d["failed"].get("D", "NO ERROR RAISED")[:78])
 
 # =================================================================== TEST E
-print("\nTEST E -- a wrong tseries_fps is REFUSED via the implied camera rate")
+print("\nTEST E -- a wrong tseries_fps is REPORTED, never refused")
 ca_e = TMP / "E_ca"
-make_ca(ca_e, 25, n_2p, P2, params=False)   # no params.json -> implied rate is the only guard
+make_ca(ca_e, 25, n_2p, P2, params=False)   # no params.json -> nothing can refuse this
 cfg = f'''
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_E")
 RUNS = {{"E": dict(beh=r"{beh}", ca=r"{ca_e}", on={on}, off={off},
                    tseries_fps={P2/2})}}
-CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns_e = run_notebook(cfg)
-check("halved tseries_fps refused (implied cam rate ~7.5 Hz)",
-      "E" in ns_e["failed"] and "imply a camera rate" in ns_e["failed"]["E"],
-      ns_e["failed"].get("E", "NO ERROR RAISED")[:90])
+check("halved tseries_fps still builds (never refuses)",
+      "E" in ns_e["results"] and "E" not in ns_e["failed"], str(ns_e["failed"]))
+if "E" in ns_e["results"]:
+    me_ = ns_e["results"]["E"][1]
+    check("implied cam rate halves, exposing the error",
+          abs(me_["cam_fps_implied"] - R_CAM_TRUE / 2) < 0.01,
+          f"{me_['cam_fps_implied']:.4f} Hz (true camera {R_CAM_TRUE})")
 
 print("\n" + "=" * 70)
 print(f"{len(FAILS)} FAILURES" if FAILS else "ALL CHECKS PASSED")
