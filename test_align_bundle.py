@@ -87,7 +87,8 @@ cfg = f'''
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_A")
 RUNS = {{"A": dict(beh=r"{beh}", ca=r"{ca}", on={on}, off={off},
-                   p2_fps={P2}, cam_fps={CAM_NOM})}}
+                   tseries_fps={P2})}}
+CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns = run_notebook(cfg)
@@ -102,8 +103,8 @@ for t_true, fp in zip(T_EV, plant):
           f"err {err*1000:+.1f} ms (tol +-{1000/R_CAM_TRUE:.0f} ms)")
 
 check("effective cam fps recovers TRUE 15.02, not nominal 15.0",
-      abs(m["cam_fps_effective"] - R_CAM_TRUE) < 1e-6,
-      f"{m['cam_fps_effective']:.5f}")
+      abs(m["cam_fps_implied"] - R_CAM_TRUE) < 1e-6,
+      f"{m['cam_fps_implied']:.5f}")
 check("dff bit-identical to input (never resampled)",
       np.array_equal(A["dff"], dff_in.astype(np.float64)))
 check("t starts at 0 and ends at (n_2p-1)/fps",
@@ -119,8 +120,10 @@ check("artifact only at the two edges",
       and not A["artifact"][5:-5].any(), f"{A['artifact'].sum()} frames")
 check("no NaN/Inf anywhere",
       all(np.isfinite(v).all() for v in A.values() if v.dtype.kind == "f"))
-check("RATIO reported near 1", abs(m["ratio"] - R_CAM_TRUE / CAM_NOM) < 1e-9,
-      f"{m['ratio']:.5f}")
+check("interp factor reported (2P faster than camera)",
+      abs(m["interp_factor"] - P2 / R_CAM_TRUE) < 1e-9, f"{m['interp_factor']:.4f}x")
+check("t-series clock is the constant hardcoded rate",
+      m["tseries_clock"] == "constant_rate" and m["tseries_fps"] == P2)
 
 z = np.load(TMP / "out_A" / "A_aligned.npz", allow_pickle=True)
 check("npz round-trips", np.array_equal(z["beh_me"], A["beh_me"])
@@ -149,7 +152,8 @@ if demo.exists():
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_C")
 RUNS = {{"C": dict(beh=r"{demo}", ca=r"{ca_d}", on={on_d}, off={off_d},
-                   p2_fps={P2}, cam_fps=15.0)}}
+                   tseries_fps={P2})}}
+CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
     ns_c = run_notebook(cfg)
@@ -159,8 +163,9 @@ ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
         check("old vintage detected", mc["beh_vintage"] == "pre-trim", mc["beh_vintage"])
         check("6 boxes carried by name", list(Ac["beh_names"]) == mc["box_names"]
               and len(mc["box_names"]) == 6, str(mc["box_names"]))
-        check("RATIO == 1.000 by construction", abs(mc["ratio"] - 1) < 3e-4,
-              f"{mc['ratio']:.5f}")
+        check("implied cam rate == 15.0 by construction",
+              abs(mc["cam_fps_implied"] - 15.0) < 5e-3,
+              f"{mc['cam_fps_implied']:.5f} Hz")
         check("output finite on real data",
               all(np.isfinite(v).all() for v in Ac.values() if v.dtype.kind == "f"))
         exec(SRC[5], ns_c)                       # the QC cell must not crash
@@ -175,7 +180,7 @@ cases = {
     "on >= off refused":           dict(on=5000, off=5000),
     "on out of range refused":     dict(on=-1, off=8000),
     "off past last frame refused": dict(on=10, off=10 ** 7),
-    "p2_fps != params.json fps":   dict(p2_fps=15.0),
+    "tseries_fps != params.json":  dict(tseries_fps=15.0),
     "None anchor refused":         dict(on=None),
     "missing dff.npy refused":     dict(kind="nodff"),
 }
@@ -188,12 +193,13 @@ for label, mod in cases.items():
         ca_x.mkdir(parents=True, exist_ok=True)
     else:
         make_ca(ca_x, 25, n_2p, P2)
-    c = dict(beh=str(beh), ca=str(ca_x), on=on, off=off, p2_fps=P2, cam_fps=CAM_NOM)
+    c = dict(beh=str(beh), ca=str(ca_x), on=on, off=off, tseries_fps=P2)
     c.update(mod)
     cfg = f'''
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_D")
 RUNS = {{"D": {c!r}}}
+CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
     ns_d = run_notebook(cfg)
@@ -201,19 +207,21 @@ ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
           ns_d["failed"].get("D", "NO ERROR RAISED")[:78])
 
 # =================================================================== TEST E
-print("\nTEST E -- a wrong p2_fps (frame averaging) is caught by RATIO")
+print("\nTEST E -- a wrong tseries_fps is REFUSED via the implied camera rate")
 ca_e = TMP / "E_ca"
-make_ca(ca_e, 25, n_2p, P2, params=False)      # no params.json -> RATIO is the only guard
+make_ca(ca_e, 25, n_2p, P2, params=False)   # no params.json -> implied rate is the only guard
 cfg = f'''
 from pathlib import Path
 OUT_DIR = Path("{TMP}/out_E")
 RUNS = {{"E": dict(beh=r"{beh}", ca=r"{ca_e}", on={on}, off={off},
-                   p2_fps={P2/2}, cam_fps={CAM_NOM})}}
+                   tseries_fps={P2/2})}}
+CAM_FPS_EXPECTED = 15.0
 ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 '''
 ns_e = run_notebook(cfg)
-re_ = ns_e["results"]["E"][1]["ratio"]
-check("RATIO flags a 2x frame-rate error", abs(re_ - 0.5) < 0.01, f"RATIO {re_:.4f}")
+check("halved tseries_fps refused (implied cam rate ~7.5 Hz)",
+      "E" in ns_e["failed"] and "imply a camera rate" in ns_e["failed"]["E"],
+      ns_e["failed"].get("E", "NO ERROR RAISED")[:90])
 
 print("\n" + "=" * 70)
 print(f"{len(FAILS)} FAILURES" if FAILS else "ALL CHECKS PASSED")
