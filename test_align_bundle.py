@@ -173,6 +173,54 @@ ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
 else:
     print("  SKIP -- demo npz not present")
 
+# =================================================================== TEST C2
+print("\nTEST C2 -- beh may be a proc/ folder; _with_time.npz must not be picked up")
+proc = TMP / "procdir"
+proc.mkdir()
+shutil.copy(beh, proc / "run1_behavior_boxtraces.npz")
+(proc / "run1_behavior_boxtraces_with_time.npz").write_bytes(b"xx")   # decoy + 2-byte file
+cfg = f'''
+from pathlib import Path
+OUT_DIR = Path("{TMP}/out_C2")
+RUNS = {{"C2": dict(beh=r"{proc}", ca=r"{ca}", on={on}, off={off},
+                    tseries_fps={P2})}}
+CAM_FPS_EXPECTED = 15.0
+ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
+'''
+ns2 = run_notebook(cfg)
+check("proc/ folder resolves to the boxtraces npz", "C2" in ns2["results"],
+      str(ns2["failed"]))
+if "C2" in ns2["results"]:
+    check("picked the real file, not _with_time",
+          ns2["results"]["C2"][1]["beh_npz"].endswith("run1_behavior_boxtraces.npz"))
+
+# a 2-byte npz named explicitly must be refused, not parsed
+cfg = f'''
+from pathlib import Path
+OUT_DIR = Path("{TMP}/out_C3")
+RUNS = {{"C3": dict(beh=r"{proc / "run1_behavior_boxtraces_with_time.npz"}", ca=r"{ca}",
+                    on={on}, off={off}, tseries_fps={P2})}}
+CAM_FPS_EXPECTED = 15.0
+ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
+'''
+ns3 = run_notebook(cfg)
+check("2-byte npz refused", "C3" in ns3["failed"] and "did not upload" in ns3["failed"]["C3"],
+      ns3["failed"].get("C3", "NO ERROR")[:70])
+
+# ambiguity must raise rather than guess
+(proc / "other_boxtraces.npz").write_bytes((proc / "run1_behavior_boxtraces.npz").read_bytes())
+cfg = f'''
+from pathlib import Path
+OUT_DIR = Path("{TMP}/out_C4")
+RUNS = {{"C4": dict(beh=r"{proc}", ca=r"{ca}", on={on}, off={off}, tseries_fps={P2})}}
+CAM_FPS_EXPECTED = 15.0
+ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
+'''
+ns4 = run_notebook(cfg)
+check("two candidates -> refuse, do not guess",
+      "C4" in ns4["failed"] and "candidates" in ns4["failed"]["C4"],
+      ns4["failed"].get("C4", "NO ERROR")[:70])
+
 # =================================================================== TEST D
 print("\nTEST D -- failure modes must RAISE, not produce a quietly-wrong bundle")
 cases = {
