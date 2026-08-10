@@ -102,8 +102,8 @@ for t_true, fp in zip(T_EV, plant):
           f"err {err*1000:+.1f} ms (tol +-{1000/R_CAM_TRUE:.0f} ms)")
 
 check("effective cam fps recovers TRUE 15.02, not nominal 15.0",
-      abs(m["cam_fps_implied"] - R_CAM_TRUE) < 1e-6,
-      f"{m['cam_fps_implied']:.5f}")
+      abs(m["cam_fps_used"] - R_CAM_TRUE) < 1e-6,
+      f"{m['cam_fps_used']:.5f}")
 check("dff bit-identical to input (never resampled)",
       np.array_equal(A["dff"], dff_in.astype(np.float64)))
 check("t starts at 0 and ends at (n_2p-1)/fps",
@@ -162,8 +162,8 @@ ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
         check("6 boxes carried by name", list(Ac["beh_names"]) == mc["box_names"]
               and len(mc["box_names"]) == 6, str(mc["box_names"]))
         check("implied cam rate == 15.0 by construction",
-              abs(mc["cam_fps_implied"] - 15.0) < 5e-3,
-              f"{mc['cam_fps_implied']:.5f} Hz")
+              abs(mc["cam_fps_used"] - 15.0) < 5e-3,
+              f"{mc['cam_fps_used']:.5f} Hz")
         check("output finite on real data",
               all(np.isfinite(v).all() for v in Ac.values() if v.dtype.kind == "f"))
         exec(SRC[5], ns_c)                       # the QC cell must not crash
@@ -216,6 +216,62 @@ check("two candidates -> refuse, do not guess",
       "C4" in ns4["failed"] and "candidates" in ns4["failed"]["C4"],
       ns4["failed"].get("C4", "NO ERROR")[:70])
 
+# =================================================================== TEST F
+print("\nTEST F -- single-anchor: camera stops early, 2P frames past coverage dropped")
+# thormouse1 geometry: both clocks 30 Hz, camera quits ~4 min before the t-series ends.
+F_2P, F_CAM = 30.0, 30.0
+n2f = 36000                                   # 1200 s of 2P
+on_f = 119
+cov_frames = 28659                            # camera recorded this many after `on`
+off_f = on_f + cov_frames
+n_cam_f = off_f + 1
+T_EV_F = [10.0, 500.0, 950.0]                 # all inside coverage
+plant_f = [int(round(on_f + t * F_CAM)) for t in T_EV_F]
+beh_f = TMP / "F_boxtraces.npz"
+make_beh(beh_f, n_cam_f, plant=plant_f)
+ca_f = TMP / "F_ca"
+make_ca(ca_f, 24, n2f, F_2P)
+cfg = f'''
+from pathlib import Path
+OUT_DIR = Path("{TMP}/out_F")
+RUNS = {{"F": dict(beh=r"{beh_f}", ca=r"{ca_f}", on={on_f}, off={off_f},
+                   tseries_fps={F_2P}, cam_fps={F_CAM})}}
+ENV_S, SAVE_MAT, REPO_DIR = 0.33, False, r"{REPO}"
+'''
+nsf = run_notebook(cfg)
+check("single-anchor run completed", "F" in nsf["results"], str(nsf["failed"]))
+if "F" in nsf["results"]:
+    Af, mf = nsf["results"]["F"]
+    check("mode is single_anchor_known_fps", mf["map_mode"] == "single_anchor_known_fps")
+    check("cam rate is the SUPPLIED one, not the anchor-implied one",
+          mf["cam_fps_used"] == F_CAM and abs(mf["cam_fps_implied_by_anchors"] - 23.88) < .05,
+          f"used {mf['cam_fps_used']} vs implied {mf['cam_fps_implied_by_anchors']:.2f}")
+    check("T truncated to coverage", mf["n_2p"] == cov_frames + 1
+          and mf["n_2p_dropped"] == n2f - cov_frames - 1,
+          f"T={mf['n_2p']} dropped={mf['n_2p_dropped']}")
+    check("all arrays share the truncated length",
+          Af["t"].shape[0] == mf["n_2p"] and Af["dff"].shape[1] == mf["n_2p"]
+          and Af["beh_me"].shape[1] == mf["n_2p"] and Af["M"].shape[1] == mf["n_2p"])
+    check("coverage ends at the right second",
+          abs(mf["coverage_end_s"] - cov_frames / F_CAM) < 1e-9,
+          f"{mf['coverage_end_s']:.3f}s")
+    for t_true in T_EV_F:
+        k = int(np.argmax(Af["beh_me"][1] * ((Af["t"] > t_true - 5) & (Af["t"] < t_true + 5))))
+        err = Af["t"][k] - t_true
+        check(f"event at {t_true:.0f}s recovered", abs(err) < 1.0 / F_CAM,
+              f"err {err*1000:+.1f} ms")
+    check("1:1 frame correspondence at 30/30 Hz",
+          abs(Af["t"][1] - 1.0 / F_2P) < 1e-12 and mf["interp_factor"] == 1.0)
+    check("no NaN after truncation",
+          all(np.isfinite(v).all() for v in Af.values() if v.dtype.kind == "f"))
+    # the same anchors WITHOUT cam_fps would stretch behaviour by 25.6%
+    cfg2 = cfg.replace(f", cam_fps={F_CAM}", "")
+    ns2 = run_notebook(cfg2)
+    A2 = ns2["results"]["F"][0]
+    k2 = int(np.argmax(A2["beh_me"][1] * ((A2["t"] > 940) & (A2["t"] < 1210))))
+    check("two-anchor on the SAME data misplaces the 950 s event (why cam_fps exists)",
+          abs(A2["t"][k2] - 950.0) > 100, f"lands at {A2['t'][k2]:.1f}s instead of 950s")
+
 # =================================================================== TEST D
 print("\nTEST D -- failure modes must RAISE, not produce a quietly-wrong bundle")
 cases = {
@@ -265,8 +321,8 @@ check("halved tseries_fps still builds (never refuses)",
 if "E" in ns_e["results"]:
     me_ = ns_e["results"]["E"][1]
     check("implied cam rate halves, exposing the error",
-          abs(me_["cam_fps_implied"] - R_CAM_TRUE / 2) < 0.01,
-          f"{me_['cam_fps_implied']:.4f} Hz (true camera {R_CAM_TRUE})")
+          abs(me_["cam_fps_used"] - R_CAM_TRUE / 2) < 0.01,
+          f"{me_['cam_fps_used']:.4f} Hz (true camera {R_CAM_TRUE})")
 
 print("\n" + "=" * 70)
 print(f"{len(FAILS)} FAILURES" if FAILS else "ALL CHECKS PASSED")
